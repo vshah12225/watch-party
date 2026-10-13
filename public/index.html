@@ -4,9 +4,18 @@
   <meta charset="utf-8" />
   <title>Watch Party (test page)</title>
   <style>
-    body { font-family: sans-serif; max-width: 760px; margin: 20px auto; }
+    body { font-family: sans-serif; max-width: 800px; margin: 20px auto; padding: 0 10px; }
     video { width: 100%; background: #000; }
     #log { height: 140px; overflow: auto; border: 1px solid #ccc; padding: 6px; font-size: 13px; }
+    .panel { border: 1px solid #ccc; border-radius: 6px; padding: 10px; margin-top: 12px; }
+    .panel h3 { margin: 0 0 8px; font-size: 15px; }
+    ul { padding-left: 18px; margin: 6px 0; }
+    li { margin: 4px 0; }
+    .bar { background: #e5e5e5; border-radius: 4px; height: 8px; margin-top: 3px; }
+    .bar > div { background: #4a7bd8; height: 8px; border-radius: 4px; }
+    .mine { font-weight: bold; }
+    input { margin: 2px 0; }
+    textarea { width: 100%; box-sizing: border-box; }
   </style>
 </head>
 <body>
@@ -27,9 +36,32 @@
       <button class="emoji">🔥</button>
       <button class="emoji">😮</button>
     </p>
-    <div id="log"></div>
-    <input id="msg" placeholder="Type a message" />
-    <button id="send">Send</button>
+
+    <div class="panel">
+      <h3>Shared playlist</h3>
+      <input id="plTitle" placeholder="Title" />
+      <input id="plUrl" placeholder="Video URL (https://...mp4)" size="40" />
+      <button id="plAdd">Add</button>
+      <ul id="playlist"></ul>
+    </div>
+
+    <div class="panel">
+      <h3>Group poll</h3>
+      <div id="pollForm">
+        <input id="pollQ" placeholder="Question" size="40" />
+        <textarea id="pollOpts" rows="3" placeholder="One option per line (2 to 6)"></textarea>
+        <button id="pollCreate">Start poll</button>
+        <button id="pollFromPl">Poll from playlist (winner plays)</button>
+      </div>
+      <div id="pollView"></div>
+    </div>
+
+    <div class="panel">
+      <h3>Chat</h3>
+      <div id="log"></div>
+      <input id="msg" placeholder="Type a message" />
+      <button id="send">Send</button>
+    </div>
   </div>
 
   <script src="/socket.io/socket.io.js"></script>
@@ -39,11 +71,20 @@
     const video = $("v");
 
     let state = null;          // latest state from the server
+    let lastVersion = -1;      // last playback version we applied to the video
     let clockOffset = 0;       // serverTime - clientTime
     let applying = false;      // true while WE change the video (so we don't echo it back)
     let myRoom = null, myName = "";
 
-    const log = (t) => { $("log").innerHTML += t + "<br>"; $("log").scrollTop = 1e9; };
+    // never put user text into innerHTML without this
+    const esc = (t) => String(t).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    const log = (html) => { $("log").innerHTML += html + "<br>"; $("log").scrollTop = 1e9; };
+    function btn(label, onClick) {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.onclick = onClick;
+      return b;
+    }
 
     // ---- clock sync (a few pings, keep the one with the smallest round trip) ----
     function syncClock() {
@@ -69,10 +110,20 @@
 
     function applyState() {
       applying = true;
-      if (!video.src.endsWith(state.videoUrl)) video.src = state.videoUrl;
-      video.currentTime = expectedPosition();
-      if (state.isPlaying) video.play().catch(() => {}); else video.pause();
-      setTimeout(() => (applying = false), 300);
+      const go = () => {
+        video.currentTime = Math.max(0, expectedPosition());
+        if (state.isPlaying) video.play().catch(() => {}); else video.pause();
+        setTimeout(() => (applying = false), 300);
+      };
+      const wanted = new URL(state.videoUrl, location.href).href;
+      if (video.src !== wanted) {
+        // new video: wait until it has loaded before seeking
+        video.src = wanted;
+        video.addEventListener("loadedmetadata", go, { once: true });
+        setTimeout(() => (applying = false), 3000); // in case the video never loads
+      } else {
+        go();
+      }
     }
 
     // ---- lobby ----
@@ -99,26 +150,103 @@
     // re-join automatically after a reconnect
     socket.on("connect", () => {
       syncClock();
+      lastVersion = -1; // force a fresh sync of the video after (re)connecting
       if (myRoom) socket.emit("room:join", { code: myRoom, name: myName }, () => {});
     });
+
+    // ---- rendering ----
+    function renderUsers() {
+      $("users").textContent = state.users
+        .map((u) => u.name + (u.id === state.hostId ? " (host)" : ""))
+        .join(", ");
+    }
+
+    function renderPlaylist() {
+      const ul = $("playlist");
+      ul.innerHTML = "";
+      if (!state.playlist.length) { ul.innerHTML = "<li><i>Empty. Add a video above.</i></li>"; return; }
+      state.playlist.forEach((item) => {
+        const li = document.createElement("li");
+        const t = document.createElement("span");
+        t.textContent = (item.id === state.currentItemId ? "▶ " : "") + item.title + " (by " + item.addedBy + ") ";
+        if (item.id === state.currentItemId) t.className = "mine";
+        li.append(t,
+          btn("Play", () => socket.emit("playlist:play", { id: item.id })),
+          btn("✕", () => socket.emit("playlist:remove", { id: item.id })));
+        ul.append(li);
+      });
+    }
+
+    function renderPoll() {
+      const box = $("pollView");
+      box.innerHTML = "";
+      const p = state.poll;
+      if (!p) return;
+      const total = p.options.reduce((a, o) => a + o.count, 0);
+      const mine = p.votes[socket.id];
+
+      const q = document.createElement("p");
+      q.innerHTML = "<b></b> " + (p.open ? "" : "<i>(closed)</i>");
+      q.querySelector("b").textContent = p.question;
+      box.append(q);
+
+      p.options.forEach((o, i) => {
+        const row = document.createElement("div");
+        const label = document.createElement("span");
+        label.textContent = o.text + " - " + o.count + " vote" + (o.count === 1 ? "" : "s") + " ";
+        if (mine === i) label.className = "mine";
+        row.append(label);
+        if (p.open) row.append(btn(mine === i ? "Voted" : "Vote", () => socket.emit("poll:vote", { index: i })));
+        const bar = document.createElement("div");
+        bar.className = "bar";
+        const fill = document.createElement("div");
+        fill.style.width = (total ? (o.count / total) * 100 : 0) + "%";
+        bar.append(fill);
+        row.append(bar);
+        box.append(row);
+      });
+
+      if (p.open && (socket.id === state.hostId || socket.id === p.creatorId)) {
+        box.append(btn("Close poll", () => socket.emit("poll:close")));
+      }
+    }
 
     // ---- server -> client ----
     socket.on("state:update", (s) => {
       state = s;
-      $("users").textContent = s.users.map((u) => u.name + (u.id === s.hostId ? " (host)" : "")).join(", ");
-      applyState();
+      renderUsers();
+      renderPlaylist();
+      renderPoll();
+      // only touch the video when playback really changed (not for chat, votes, joins...)
+      if (s.version !== lastVersion) {
+        lastVersion = s.version;
+        applyState();
+      }
     });
-    socket.on("chat:message", (c) => log(`<b>${c.from}:</b> ${c.text}`));
-    socket.on("chat:system", (t) => log(`<i>${t}</i>`));
-    socket.on("reaction:show", (r) => log(`${r.from} reacted ${r.emoji}`));
+    socket.on("chat:message", (c) => log(`<b>${esc(c.from)}:</b> ${esc(c.text)}`));
+    socket.on("chat:system", (t) => log(`<i>${esc(t)}</i>`));
+    socket.on("reaction:show", (r) => log(`${esc(r.from)} reacted ${esc(r.emoji)}`));
 
     // ---- client -> server (only when the USER did it, not when we did) ----
     video.onplay  = () => !applying && socket.emit("playback:play",  { position: video.currentTime });
     video.onpause = () => !applying && socket.emit("playback:pause", { position: video.currentTime });
     video.onseeked = () => !applying && socket.emit("playback:seek", { position: video.currentTime });
+    // video finished -> ask the server to play the next playlist item
+    video.onended = () => state && socket.emit("playlist:next", { itemId: state.currentItemId });
 
     $("send").onclick = () => { socket.emit("chat:message", $("msg").value); $("msg").value = ""; };
+    $("msg").onkeydown = (e) => { if (e.key === "Enter") $("send").click(); };
     document.querySelectorAll(".emoji").forEach((b) => (b.onclick = () => socket.emit("reaction:send", b.textContent)));
+
+    $("plAdd").onclick = () => {
+      socket.emit("playlist:add", { title: $("plTitle").value, url: $("plUrl").value });
+      $("plTitle").value = ""; $("plUrl").value = "";
+    };
+    $("pollCreate").onclick = () => {
+      socket.emit("poll:create", { question: $("pollQ").value, options: $("pollOpts").value.split("\n") });
+      $("pollQ").value = ""; $("pollOpts").value = "";
+    };
+    $("pollFromPl").onclick = () => socket.emit("poll:create", { fromPlaylist: true });
 
     // ---- drift correction, every 2 seconds ----
     setInterval(() => {
