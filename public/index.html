@@ -6,6 +6,8 @@
   <style>
     body { font-family: sans-serif; max-width: 800px; margin: 20px auto; padding: 0 10px; }
     video { width: 100%; background: #000; }
+    #ytbox { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; display: none; }
+    #ytbox iframe { position: absolute; inset: 0; width: 100%; height: 100%; }
     #log { height: 140px; overflow: auto; border: 1px solid #ccc; padding: 6px; font-size: 13px; }
     .panel { border: 1px solid #ccc; border-radius: 6px; padding: 10px; margin-top: 12px; }
     .panel h3 { margin: 0 0 8px; font-size: 15px; }
@@ -14,6 +16,7 @@
     .bar { background: #e5e5e5; border-radius: 4px; height: 8px; margin-top: 3px; }
     .bar > div { background: #4a7bd8; height: 8px; border-radius: 4px; }
     .mine { font-weight: bold; }
+    .hint { color: #666; font-size: 12px; }
     input { margin: 2px 0; }
     textarea { width: 100%; box-sizing: border-box; }
   </style>
@@ -31,6 +34,8 @@
   <div id="room" style="display:none">
     <p>Room: <b id="roomCode"></b> | Users: <span id="users"></span> | Drift: <span id="drift">0</span> ms</p>
     <video id="v" controls muted></video>
+    <div id="ytbox"><div id="ytplayer"></div></div>
+    <p class="hint">Videos start muted (browsers block autoplay with sound). Use the speaker icon to unmute.</p>
     <p>
       <button class="emoji">😂</button>
       <button class="emoji">🔥</button>
@@ -40,7 +45,7 @@
     <div class="panel">
       <h3>Shared playlist</h3>
       <input id="plTitle" placeholder="Title" />
-      <input id="plUrl" placeholder="Video URL (https://...mp4)" size="40" />
+      <input id="plUrl" placeholder="YouTube link or .mp4 link" size="40" />
       <button id="plAdd">Add</button>
       <ul id="playlist"></ul>
     </div>
@@ -71,14 +76,22 @@
     const video = $("v");
 
     let state = null;          // latest state from the server
-    let lastVersion = -1;      // last playback version we applied to the video
+    let lastVersion = -1;      // last playback version we applied to the player
     let clockOffset = 0;       // serverTime - clientTime
-    let applying = false;      // true while WE change the video (so we don't echo it back)
+    let applying = false;      // true while WE change the player (so we don't echo it back)
     let myRoom = null, myName = "";
+
+    // which player is active: "html5" (<video>) or "yt" (YouTube)
+    let mode = "html5";
+    let yt = null, ytReady = false, ytApiState = 0, ytCurrentId = null;
+    const ytWaiters = [];
+    let ytLast = { t: null, at: 0, ps: -1 }; // for detecting seeks made inside the YouTube player
+    let ytPending = null, ytLastHardSeek = 0;
 
     // never put user text into innerHTML without this
     const esc = (t) => String(t).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
     const log = (html) => { $("log").innerHTML += html + "<br>"; $("log").scrollTop = 1e9; };
+    const dbg = (t) => log(`<i style="color:#888">[sync] ${esc(t)}</i>`);
     function btn(label, onClick) {
       const b = document.createElement("button");
       b.textContent = label;
@@ -108,7 +121,136 @@
       return state.position + (serverNow - state.updatedAt) / 1000;
     }
 
+    // ---- YouTube helpers ----
+    // returns the 11-character video id for any common YouTube link, or null
+    function ytId(url) {
+      try {
+        const u = new URL(url);
+        const h = u.hostname.replace(/^www\.|^m\./, "");
+        let id = null;
+        if (h === "youtu.be") id = u.pathname.slice(1).split("/")[0];
+        else if (h === "youtube.com" || h === "music.youtube.com" || h === "youtube-nocookie.com") {
+          if (u.pathname === "/watch") id = u.searchParams.get("v");
+          else {
+            const m = u.pathname.match(/^\/(embed|shorts|live|v)\/([\w-]+)/);
+            if (m) id = m[2];
+          }
+        }
+        return id && /^[\w-]{11}$/.test(id) ? id : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // loads the YouTube API once, then runs the callback when the player is ready
+    function withYT(cb) {
+      if (ytReady) return cb();
+      ytWaiters.push(cb);
+      if (ytApiState !== 0) return;
+      ytApiState = 1;
+      window.onYouTubeIframeAPIReady = () => {
+        yt = new YT.Player("ytplayer", {
+          width: "100%",
+          height: "100%",
+          playerVars: { playsinline: 1, rel: 0 },
+          events: {
+            onReady: () => {
+              ytReady = true;
+              yt.mute(); // muted so autoplay is allowed
+              ytWaiters.splice(0).forEach((f) => f());
+            },
+            onStateChange: onYtState,
+            onError: (e) => log(`<i>YouTube error ${esc(e.data)} (the video may not allow embedding)</i>`),
+          },
+        });
+      };
+      const tag = document.createElement("script");
+      tag.src = "https://www.youtube.com/iframe_api";
+      document.head.append(tag);
+    }
+
+    // The YouTube player has no "play/pause/seek by user" events, only state changes.
+    // We only send something to the server when the player disagrees with the server state,
+    // which also stops our own changes from bouncing back as new actions.
+    function onYtState(e) {
+      if (mode !== "yt" || !state || ytId(state.videoUrl) !== ytCurrentId) return;
+      const s = e.data;            // 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
+      if (s === 1 || s === 2) {
+        // The player often flickers through pause/play (buffering, ads, seeking, hidden tab).
+        // So wait a moment and only react if it is STILL in that state and we did not cause it.
+        clearTimeout(ytPending);
+        ytPending = setTimeout(() => {
+          if (mode !== "yt" || !state || applying || document.hidden) return;
+          const now = yt.getPlayerState(), t = yt.getCurrentTime();
+          if (now === 1 && !state.isPlaying) {
+            dbg("you pressed play in YouTube -> sent play");
+            socket.emit("playback:play", { position: t });
+          } else if (now === 2 && state.isPlaying) {
+            dbg("you pressed pause in YouTube -> sent pause");
+            socket.emit("playback:pause", { position: t });
+          }
+        }, 300);
+      } else if (s === 0) {
+        socket.emit("playlist:next", { itemId: state.currentItemId });
+        const idx = state.playlist.findIndex((i) => i.id === state.currentItemId);
+        if (idx === -1 || !state.playlist[idx + 1]) {
+          // nothing after this video: pause so late joiners don't land past the end
+          socket.emit("playback:pause", { position: yt.getDuration() });
+        }
+      }
+    }
+
+    // Detect seeks made by dragging YouTube's progress bar (there is no event for it)
+    setInterval(() => {
+      if (mode !== "yt" || !ytReady || !state) return;
+      const t = yt.getCurrentTime(), now = Date.now(), ps = yt.getPlayerState();
+      if (ytLast.t !== null && !applying && ps !== 3 && ytLast.ps !== 3) {
+        const expectedLocal = ytLast.t + (ytLast.ps === 1 ? (now - ytLast.at) / 1000 : 0);
+        const jumped = Math.abs(t - expectedLocal) > 1.5;
+        const differsFromRoom = Math.abs(t - expectedPosition()) > 1;
+        if (jumped && differsFromRoom) socket.emit("playback:seek", { position: t });
+      }
+      ytLast = { t, at: now, ps };
+    }, 500);
+
+    // ---- showing / hiding the two players ----
+    function setMode(m) {
+      mode = m;
+      video.style.display = m === "html5" ? "block" : "none";
+      $("ytbox").style.display = m === "yt" ? "block" : "none";
+      if (m === "html5") {
+        if (ytReady) yt.pauseVideo();
+        ytCurrentId = null; // so going back to YouTube loads the video again
+      } else {
+        video.pause();
+      }
+    }
+
     function applyState() {
+      const id = ytId(state.videoUrl);
+      if (id) applyYT(id); else applyHtml5();
+    }
+
+    function applyYT(id) {
+      setMode("yt");
+      withYT(() => {
+        const target = Math.max(0, expectedPosition());
+        applying = true;
+        if (ytCurrentId !== id) {
+          ytCurrentId = id;
+          const opts = { videoId: id, startSeconds: target };
+          if (state.isPlaying) yt.loadVideoById(opts); else yt.cueVideoById(opts);
+        } else {
+          if (Math.abs(yt.getCurrentTime() - target) > 0.4) yt.seekTo(target, true);
+          if (state.isPlaying) yt.playVideo(); else yt.pauseVideo();
+        }
+        ytLast = { t: null, at: 0, ps: -1 };
+        setTimeout(() => (applying = false), 800);
+      });
+    }
+
+    function applyHtml5() {
+      setMode("html5");
       applying = true;
       const go = () => {
         video.currentTime = Math.max(0, expectedPosition());
@@ -217,7 +359,7 @@
       renderUsers();
       renderPlaylist();
       renderPoll();
-      // only touch the video when playback really changed (not for chat, votes, joins...)
+      // only touch the player when playback really changed (not for chat, votes, joins...)
       if (s.version !== lastVersion) {
         lastVersion = s.version;
         applyState();
@@ -227,12 +369,12 @@
     socket.on("chat:system", (t) => log(`<i>${esc(t)}</i>`));
     socket.on("reaction:show", (r) => log(`${esc(r.from)} reacted ${esc(r.emoji)}`));
 
-    // ---- client -> server (only when the USER did it, not when we did) ----
-    video.onplay  = () => !applying && socket.emit("playback:play",  { position: video.currentTime });
-    video.onpause = () => !applying && socket.emit("playback:pause", { position: video.currentTime });
-    video.onseeked = () => !applying && socket.emit("playback:seek", { position: video.currentTime });
+    // ---- client -> server for the normal <video> (only when the USER did it) ----
+    video.onplay   = () => mode === "html5" && !applying && socket.emit("playback:play",  { position: video.currentTime });
+    video.onpause  = () => mode === "html5" && !applying && socket.emit("playback:pause", { position: video.currentTime });
+    video.onseeked = () => mode === "html5" && !applying && socket.emit("playback:seek",  { position: video.currentTime });
     // video finished -> ask the server to play the next playlist item
-    video.onended = () => state && socket.emit("playlist:next", { itemId: state.currentItemId });
+    video.onended  = () => mode === "html5" && state && socket.emit("playlist:next", { itemId: state.currentItemId });
 
     $("send").onclick = () => { socket.emit("chat:message", $("msg").value); $("msg").value = ""; };
     $("msg").onkeydown = (e) => { if (e.key === "Enter") $("send").click(); };
@@ -250,16 +392,45 @@
 
     // ---- drift correction, every 2 seconds ----
     setInterval(() => {
-      if (!state || !state.isPlaying || video.paused) return;
+      if (!state || !state.isPlaying) return;
+
+      if (mode === "yt") {
+        // YouTube only has fixed speeds (0.75x, 1x, 1.25x...), so we nudge with those
+        // and only jump when we are far off (jumping makes YouTube re-buffer and freeze).
+        if (!ytReady || applying || yt.getPlayerState() !== 1) return;
+        const driftMs = (yt.getCurrentTime() - expectedPosition()) * 1000;
+        $("drift").textContent = Math.round(driftMs);
+        const abs = Math.abs(driftMs);
+        if (abs > 2000 && Date.now() - ytLastHardSeek > 5000) {
+          ytLastHardSeek = Date.now();
+          dbg("far out of sync (" + Math.round(driftMs) + " ms) -> jumping");
+          applying = true;
+          yt.seekTo(expectedPosition(), true);
+          ytLast = { t: null, at: 0, ps: -1 };
+          setTimeout(() => (applying = false), 800);
+        } else if (abs > 300) {
+          yt.setPlaybackRate(driftMs > 0 ? 0.75 : 1.25);
+        } else if (abs < 150) {
+          yt.setPlaybackRate(1);
+        }
+        return;
+      }
+
+      if (video.paused) return;
       const driftMs = (video.currentTime - expectedPosition()) * 1000;
       $("drift").textContent = Math.round(driftMs);
       const abs = Math.abs(driftMs);
       applying = true;
-      if (abs > 500) video.currentTime = expectedPosition();           // too far: jump
+      if (abs > 500) video.currentTime = expectedPosition();              // too far: jump
       else if (abs > 200) video.playbackRate = driftMs > 0 ? 0.95 : 1.05; // small: slow down / speed up
-      else video.playbackRate = 1;                                      // fine
+      else video.playbackRate = 1;                                         // fine
       setTimeout(() => (applying = false), 300);
-    }, 2000);
+    }, 1000);
+
+    // coming back to a tab that was in the background: catch up with the room
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && state) applyState();
+    });
   </script>
 </body>
 </html>

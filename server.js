@@ -12,7 +12,7 @@ const io = new Server(server);
 const HOST_ONLY = false;
 
 const DEFAULT_VIDEO =
-  "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
+  "https://www.youtube.com/watch?v=B6NVvtIz9_Q&t=2628s";
 
 app.use(express.static(path.join(__dirname, "public")));
 // Invite link: /room/ABC123 -> same page, the frontend reads the code from the URL
