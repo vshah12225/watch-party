@@ -1,0 +1,17 @@
+{
+  "clients": 30,
+  "rounds": 200,
+  "deliveries": 6000,
+  "missed": 0,
+  "latency_ms": {
+    "mean": 1.27,
+    "p50": 1.18,
+    "p95": 2.28,
+    "p99": 2.67,
+    "max": 4.06
+  },
+  "concurrent_bursts": 30,
+  "inconsistent_bursts": 0,
+  "target_p95_under_250ms": true,
+  "when": "2026-10-13T19:59:49.582Z"
+}
