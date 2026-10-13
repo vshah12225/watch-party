@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Watch Party (test page)</title>
+  <style>
+    body { font-family: sans-serif; max-width: 760px; margin: 20px auto; }
+    video { width: 100%; background: #000; }
+    #log { height: 140px; overflow: auto; border: 1px solid #ccc; padding: 6px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h2>Watch Party</h2>
+
+  <div id="lobby">
+    <input id="name" placeholder="Your name" />
+    <button id="create">Create room</button>
+    <input id="code" placeholder="Room code" />
+    <button id="join">Join</button>
+  </div>
+
+  <div id="room" style="display:none">
+    <p>Room: <b id="roomCode"></b> | Users: <span id="users"></span> | Drift: <span id="drift">0</span> ms</p>
+    <video id="v" controls muted></video>
+    <p>
+      <button class="emoji">😂</button>
+      <button class="emoji">🔥</button>
+      <button class="emoji">😮</button>
+    </p>
+    <div id="log"></div>
+    <input id="msg" placeholder="Type a message" />
+    <button id="send">Send</button>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    const $ = (id) => document.getElementById(id);
+    const video = $("v");
+
+    let state = null;          // latest state from the server
+    let clockOffset = 0;       // serverTime - clientTime
+    let applying = false;      // true while WE change the video (so we don't echo it back)
+    let myRoom = null, myName = "";
+
+    const log = (t) => { $("log").innerHTML += t + "<br>"; $("log").scrollTop = 1e9; };
+
+    // ---- clock sync (a few pings, keep the one with the smallest round trip) ----
+    function syncClock() {
+      let best = { rtt: Infinity, offset: 0 }, n = 0;
+      (function ping() {
+        const t0 = Date.now();
+        socket.emit("time:ping", (serverTime) => {
+          const t1 = Date.now(), rtt = t1 - t0;
+          if (rtt < best.rtt) best = { rtt, offset: serverTime + rtt / 2 - t1 };
+          clockOffset = best.offset;
+          if (++n < 5) setTimeout(ping, 100);
+        });
+      })();
+    }
+
+    // Where should the video be right now?
+    function expectedPosition() {
+      if (!state) return 0;
+      if (!state.isPlaying) return state.position;
+      const serverNow = Date.now() + clockOffset;
+      return state.position + (serverNow - state.updatedAt) / 1000;
+    }
+
+    function applyState() {
+      applying = true;
+      if (!video.src.endsWith(state.videoUrl)) video.src = state.videoUrl;
+      video.currentTime = expectedPosition();
+      if (state.isPlaying) video.play().catch(() => {}); else video.pause();
+      setTimeout(() => (applying = false), 300);
+    }
+
+    // ---- lobby ----
+    function enterRoom(res) {
+      if (!res.ok) return alert(res.error);
+      myRoom = res.code;
+      history.replaceState(null, "", "/room/" + res.code);
+      $("lobby").style.display = "none";
+      $("room").style.display = "block";
+      $("roomCode").textContent = res.code;
+    }
+    $("create").onclick = () => {
+      myName = $("name").value || "Guest";
+      socket.emit("room:create", { name: myName }, enterRoom);
+    };
+    $("join").onclick = () => {
+      myName = $("name").value || "Guest";
+      socket.emit("room:join", { code: $("code").value, name: myName }, enterRoom);
+    };
+    // invite link: /room/ABC123 pre-fills the code
+    const m = location.pathname.match(/^\/room\/(\w+)/);
+    if (m) $("code").value = m[1];
+
+    // re-join automatically after a reconnect
+    socket.on("connect", () => {
+      syncClock();
+      if (myRoom) socket.emit("room:join", { code: myRoom, name: myName }, () => {});
+    });
+
+    // ---- server -> client ----
+    socket.on("state:update", (s) => {
+      state = s;
+      $("users").textContent = s.users.map((u) => u.name + (u.id === s.hostId ? " (host)" : "")).join(", ");
+      applyState();
+    });
+    socket.on("chat:message", (c) => log(`<b>${c.from}:</b> ${c.text}`));
+    socket.on("chat:system", (t) => log(`<i>${t}</i>`));
+    socket.on("reaction:show", (r) => log(`${r.from} reacted ${r.emoji}`));
+
+    // ---- client -> server (only when the USER did it, not when we did) ----
+    video.onplay  = () => !applying && socket.emit("playback:play",  { position: video.currentTime });
+    video.onpause = () => !applying && socket.emit("playback:pause", { position: video.currentTime });
+    video.onseeked = () => !applying && socket.emit("playback:seek", { position: video.currentTime });
+
+    $("send").onclick = () => { socket.emit("chat:message", $("msg").value); $("msg").value = ""; };
+    document.querySelectorAll(".emoji").forEach((b) => (b.onclick = () => socket.emit("reaction:send", b.textContent)));
+
+    // ---- drift correction, every 2 seconds ----
+    setInterval(() => {
+      if (!state || !state.isPlaying || video.paused) return;
+      const driftMs = (video.currentTime - expectedPosition()) * 1000;
+      $("drift").textContent = Math.round(driftMs);
+      const abs = Math.abs(driftMs);
+      applying = true;
+      if (abs > 500) video.currentTime = expectedPosition();           // too far: jump
+      else if (abs > 200) video.playbackRate = driftMs > 0 ? 0.95 : 1.05; // small: slow down / speed up
+      else video.playbackRate = 1;                                      // fine
+      setTimeout(() => (applying = false), 300);
+    }, 2000);
+  </script>
+</body>
+</html>
