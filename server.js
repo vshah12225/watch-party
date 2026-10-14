@@ -1,3 +1,4 @@
+  require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const path = require("path");
@@ -15,6 +16,7 @@ const DEFAULT_VIDEO =
   "https://www.youtube.com/watch?v=B6NVvtIz9_Q&t=2628s";
 
 app.use(express.static(path.join(__dirname, "public")));
+  require("./movies")(app);
 // Invite link: /room/ABC123 -> same page, the frontend reads the code from the URL
 app.get("/room/:code", (req, res) =>
   res.sendFile(path.join(__dirname, "public", "index.html"))

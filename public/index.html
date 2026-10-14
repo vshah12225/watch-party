@@ -17,6 +17,11 @@
     .bar > div { background: #4a7bd8; height: 8px; border-radius: 4px; }
     .mine { font-weight: bold; }
     .hint { color: #666; font-size: 12px; }
+    .movie { display: flex; gap: 10px; padding: 8px 0; border-top: 1px solid #eee; }
+    .movie img { width: 60px; height: 90px; object-fit: cover; background: #ddd; border-radius: 4px; flex: none; }
+    .movie .info { flex: 1; font-size: 13px; }
+    .movie .info b { font-size: 14px; }
+    #mvResults { max-height: 420px; overflow: auto; margin-top: 8px; }
     input { margin: 2px 0; }
     textarea { width: 100%; box-sizing: border-box; }
   </style>
@@ -48,6 +53,28 @@
       <input id="plUrl" placeholder="YouTube link or .mp4 link" size="40" />
       <button id="plAdd">Add</button>
       <ul id="playlist"></ul>
+    </div>
+
+    <div class="panel">
+      <h3>Find movies</h3>
+      <input id="mvQ" placeholder="Search all movies (typos are ok)" size="30" />
+      <select id="mvCat">
+        <option value="popular">Popular</option>
+        <option value="top_rated">Top rated</option>
+        <option value="now_playing">Now playing</option>
+        <option value="upcoming">Upcoming</option>
+        <option value="all">All</option>
+      </select>
+      <select id="mvGenre"><option value="">All genres</option></select>
+      <select id="mvRating">
+        <option value="">Any rating</option>
+        <option value="6">6+</option>
+        <option value="7">7+</option>
+        <option value="8">8+</option>
+      </select>
+      <input id="mvYear" placeholder="Year" size="5" />
+      <div id="mvStatus" class="hint"></div>
+      <div id="mvResults"></div>
     </div>
 
     <div class="panel">
@@ -276,6 +303,8 @@
       $("lobby").style.display = "none";
       $("room").style.display = "block";
       $("roomCode").textContent = res.code;
+      loadGenres();
+      searchMovies();
     }
     $("create").onclick = () => {
       myName = $("name").value || "Guest";
@@ -389,6 +418,88 @@
       $("pollQ").value = ""; $("pollOpts").value = "";
     };
     $("pollFromPl").onclick = () => socket.emit("poll:create", { fromPlaylist: true });
+
+    // ---- movie discovery (talks to our own /api/movies routes) ----
+    let mvTimer = null;
+    const mvDebounced = () => { clearTimeout(mvTimer); mvTimer = setTimeout(searchMovies, 300); };
+
+    async function loadGenres() {
+      try {
+        const r = await fetch("/api/movies/genres");
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error);
+        d.genres.forEach((g) => {
+          const o = document.createElement("option");
+          o.value = g.id;
+          o.textContent = g.name;
+          $("mvGenre").append(o);
+        });
+      } catch (e) { /* the status line shows the real problem when we search */ }
+    }
+
+    async function searchMovies() {
+      const q = $("mvQ").value.trim();
+      const params = new URLSearchParams({
+        q,
+        category: q ? "all" : $("mvCat").value, // when searching, look through everything
+        genre: $("mvGenre").value,
+        minRating: $("mvRating").value,
+        year: $("mvYear").value.trim(),
+      });
+      $("mvStatus").textContent = "Loading...";
+      try {
+        const r = await fetch("/api/movies?" + params);
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "Search failed");
+        $("mvStatus").textContent = d.total + " movie" + (d.total === 1 ? "" : "s") + " found" + (d.total > d.movies.length ? " (showing " + d.movies.length + ")" : "");
+        renderMovies(d.movies);
+      } catch (e) {
+        $("mvStatus").textContent = e.message;
+        $("mvResults").innerHTML = "";
+      }
+    }
+
+    function renderMovies(list) {
+      const box = $("mvResults");
+      box.innerHTML = "";
+      list.forEach((m) => {
+        const row = document.createElement("div");
+        row.className = "movie";
+        const img = document.createElement("img");
+        if (m.poster_path) img.src = "https://image.tmdb.org/t/p/w185" + m.poster_path;
+        img.alt = "";
+        const info = document.createElement("div");
+        info.className = "info";
+        const title = document.createElement("b");
+        title.textContent = m.title;
+        const meta = document.createElement("div");
+        meta.className = "hint";
+        meta.textContent = (m.release_date || "").slice(0, 4) + " | rating " + m.vote_average.toFixed(1);
+        const about = document.createElement("div");
+        about.textContent = m.overview.length > 160 ? m.overview.slice(0, 160) + "..." : m.overview;
+        const add = btn("Add trailer to playlist", () => addTrailer(m, add));
+        info.append(title, meta, about, add);
+        row.append(img, info);
+        box.append(row);
+      });
+    }
+
+    async function addTrailer(m, button) {
+      button.disabled = true;
+      button.textContent = "Finding trailer...";
+      try {
+        const r = await fetch("/api/movies/" + m.id + "/trailer");
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || "No trailer");
+        socket.emit("playlist:add", { title: m.title + " (trailer)", url: d.url });
+        button.textContent = "Added ✓";
+      } catch (e) {
+        button.textContent = e.message;
+      }
+    }
+
+    ["mvQ", "mvYear"].forEach((id) => ($(id).oninput = mvDebounced));
+    ["mvCat", "mvGenre", "mvRating"].forEach((id) => ($(id).onchange = searchMovies));
 
     // ---- drift correction, every 2 seconds ----
     setInterval(() => {
