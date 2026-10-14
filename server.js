@@ -24,6 +24,7 @@ app.get("/room/:code", (req, res) =>
 
 // ---------- Room storage (in memory) ----------
 const rooms = new Map(); // code -> room
+   require("./health")(app, io, rooms);
 
 function makeCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";

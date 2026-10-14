@@ -17,6 +17,8 @@
     .bar > div { background: #4a7bd8; height: 8px; border-radius: 4px; }
     .mine { font-weight: bold; }
     .hint { color: #666; font-size: 12px; }
+    .dot { font-size: 13px; }
+    .good { color: #2e9e4f; } .ok { color: #e0a800; } .bad { color: #d33; } .idle { color: #aaa; }
     .movie { display: flex; gap: 10px; padding: 8px 0; border-top: 1px solid #eee; }
     .movie img { width: 60px; height: 90px; object-fit: cover; background: #ddd; border-radius: 4px; flex: none; }
     .movie .info { flex: 1; font-size: 13px; }
@@ -37,7 +39,10 @@
   </div>
 
   <div id="room" style="display:none">
-    <p>Room: <b id="roomCode"></b> | Users: <span id="users"></span> | Drift: <span id="drift">0</span> ms</p>
+    <p>Room: <b id="roomCode"></b> | Users: <span id="users"></span> | My drift: <span id="drift">0</span> ms</p>
+    <p class="hint">Sync health: <b id="syncScore">idle</b> &nbsp;
+      (<span class="dot good">●</span> under 200 ms &nbsp;<span class="dot ok">●</span> 200 to 500 ms &nbsp;<span class="dot bad">●</span> over 500 ms &nbsp;<span class="dot idle">●</span> paused or buffering)
+      &nbsp;<a href="/stats.html" target="_blank">live statistics</a></p>
     <video id="v" controls muted></video>
     <div id="ytbox"><div id="ytplayer"></div></div>
     <p class="hint">Videos start muted (browsers block autoplay with sound). Use the speaker icon to unmute.</p>
@@ -75,6 +80,7 @@
       <input id="mvYear" placeholder="Year" size="5" />
       <div id="mvStatus" class="hint"></div>
       <div id="mvResults"></div>
+      <div class="hint" style="margin-top:6px">Movie data: TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB.</div>
     </div>
 
     <div class="panel">
@@ -103,6 +109,7 @@
     const video = $("v");
 
     let state = null;          // latest state from the server
+    let health = null;         // latest sync health from the server
     let lastVersion = -1;      // last playback version we applied to the player
     let clockOffset = 0;       // serverTime - clientTime
     let applying = false;      // true while WE change the player (so we don't echo it back)
@@ -327,9 +334,25 @@
 
     // ---- rendering ----
     function renderUsers() {
-      $("users").textContent = state.users
-        .map((u) => u.name + (u.id === state.hostId ? " (host)" : ""))
-        .join(", ");
+      const box = $("users");
+      box.innerHTML = "";
+      state.users.forEach((u, i) => {
+        if (i) box.append(", ");
+        const hu = health && health.users[u.id];
+        const name = document.createElement("span");
+        name.textContent = u.name + (u.id === state.hostId ? " (host)" : "") + " ";
+        const dot = document.createElement("span");
+        dot.className = "dot " + (hu ? hu.status : "idle");
+        dot.textContent = "●";
+        dot.title = hu && hu.drift !== null ? hu.drift + " ms from the room" : "no data (paused or buffering)";
+        box.append(name, dot);
+      });
+    }
+
+    function renderScore() {
+      const el = $("syncScore");
+      if (!health || !health.active) { el.textContent = "idle"; return; }
+      el.textContent = health.inSync + " of " + health.active + " in sync (within 500 ms)";
     }
 
     function renderPlaylist() {
@@ -393,6 +416,11 @@
         lastVersion = s.version;
         applyState();
       }
+    });
+    socket.on("health:update", (hh) => {
+      health = hh;
+      if (state) renderUsers();
+      renderScore();
     });
     socket.on("chat:message", (c) => log(`<b>${esc(c.from)}:</b> ${esc(c.text)}`));
     socket.on("chat:system", (t) => log(`<i>${esc(t)}</i>`));
@@ -501,7 +529,17 @@
     ["mvQ", "mvYear"].forEach((id) => ($(id).oninput = mvDebounced));
     ["mvCat", "mvGenre", "mvRating"].forEach((id) => ($(id).onchange = searchMovies));
 
-    // ---- drift correction, every 2 seconds ----
+    // ---- tell the server how far we are from the room (powers the health dots and statistics) ----
+    let lastRtt = null, reportCount = 0;
+    function report(driftMs, player) {
+      socket.emit("sync:report", { driftMs: Math.round(driftMs), player, rtt: lastRtt });
+      if (++reportCount % 5 === 0) { // measure the round trip every 5th report
+        const t0 = Date.now();
+        socket.emit("time:ping", () => { lastRtt = Date.now() - t0; });
+      }
+    }
+
+    // ---- drift correction, every second ----
     setInterval(() => {
       if (!state || !state.isPlaying) return;
 
@@ -511,6 +549,7 @@
         if (!ytReady || applying || yt.getPlayerState() !== 1) return;
         const driftMs = (yt.getCurrentTime() - expectedPosition()) * 1000;
         $("drift").textContent = Math.round(driftMs);
+        report(driftMs, "yt");
         const abs = Math.abs(driftMs);
         if (abs > 2000 && Date.now() - ytLastHardSeek > 5000) {
           ytLastHardSeek = Date.now();
@@ -530,6 +569,7 @@
       if (video.paused) return;
       const driftMs = (video.currentTime - expectedPosition()) * 1000;
       $("drift").textContent = Math.round(driftMs);
+      report(driftMs, "html5");
       const abs = Math.abs(driftMs);
       applying = true;
       if (abs > 500) video.currentTime = expectedPosition();              // too far: jump

@@ -1,31 +1,74 @@
-// Movie discovery for Watch Party (TMDB + fuzzy search)
+// Movie discovery for Watch Party (TMDB + fuzzy search + saved copy on disk)
 // Needs a free TMDB key in a .env file:  TMDB_API_KEY=your_key_here
+//
+// Every successful load from TMDB is saved to data/movies-cache.json (movies, genres and
+// trailer links). If TMDB can't be reached later (blocked network, no internet, no key),
+// the saved copy is used, so search and trailers still work.
 //
 // Routes:
 //   GET /api/movies/genres
 //   GET /api/movies?q=&category=&genre=&year=&minRating=&limit=
 //   GET /api/movies/:id/trailer   -> YouTube trailer link for a movie
 
+const fs = require("fs");
+const path = require("path");
 const Fuse = require("fuse.js");
 
 const TMDB = "https://api.themoviedb.org/3";
-const CACHE_MS = 60 * 60 * 1000; // refresh the movie pool every hour
+const CACHE_MS = 60 * 60 * 1000; // try to refresh the pool every hour
+const RETRY_MS = 5 * 60 * 1000;  // but if TMDB is unreachable, wait 5 minutes between tries
+const CACHE_FILE = process.env.MOVIES_CACHE_FILE || path.join(__dirname, "data", "movies-cache.json");
 
-// one call to TMDB (works with both the v3 "API Key" and the long "Read Access Token")
-async function tmdb(path, params = {}) {
+// ---------- saved copy on disk ----------
+let pool = { at: 0, items: [] };
+let genreCache = null;
+let trailers = {}; // movie id -> { url, name }
+let building = null;
+let lastTry = 0;
+
+function loadDisk() {
+  try {
+    const d = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"));
+    if (Array.isArray(d.items) && d.items.length) pool = { at: d.at || 0, items: d.items };
+    if (Array.isArray(d.genres)) genreCache = d.genres;
+    if (d.trailers && typeof d.trailers === "object") trailers = d.trailers;
+    console.log(`[movies] loaded ${pool.items.length} saved movies and ${Object.keys(trailers).length} trailers`);
+  } catch (e) {
+    /* no saved copy yet, that's fine */
+  }
+}
+
+function saveDisk() {
+  try {
+    fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
+    fs.writeFileSync(CACHE_FILE, JSON.stringify({ at: pool.at, items: pool.items, genres: genreCache, trailers }));
+  } catch (e) {
+    console.warn("[movies] could not save the cache:", e.message);
+  }
+}
+
+// ---------- one call to TMDB (works with both the v3 "API Key" and the long "Read Access Token") ----------
+async function tmdb(p, params = {}) {
   const key = (process.env.TMDB_API_KEY || "").trim();
   if (!key) throw new Error("NO_KEY");
-  const url = new URL(TMDB + path);
+  const url = new URL(TMDB + p);
   Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
   const headers = { accept: "application/json" };
   if (key.length > 40) headers.Authorization = "Bearer " + key;
   else url.searchParams.set("api_key", key);
-  const res = await fetch(url, { headers });
+  let res;
+  try {
+    res = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
+  } catch (e) {
+    // "fetch failed" hides the real reason in e.cause (ENOTFOUND, ECONNRESET, ...)
+    const code = e.name === "TimeoutError" ? "timeout" : (e.cause && (e.cause.code || e.cause.message)) || e.message;
+    throw new Error("NETWORK " + code);
+  }
   if (!res.ok) throw new Error("TMDB error " + res.status);
   return res.json();
 }
 
-// ---------- the pool: ~300 movies from several TMDB lists, kept in memory ----------
+// ---------- the pool: ~300 movies from several TMDB lists ----------
 // We search this pool ourselves with Fuse.js so typos like "avengrs" still work.
 const LISTS = [
   ["popular", 5],
@@ -34,17 +77,12 @@ const LISTS = [
   ["upcoming", 2],
 ];
 
-let pool = { at: 0, items: [] };
-let building = null;
-
 async function buildPool() {
   const byId = new Map();
   const jobs = [];
   for (const [category, pages] of LISTS) {
     for (let page = 1; page <= pages; page++) {
-      jobs.push(
-        tmdb("/movie/" + category, { page, language: "en-US" }).then((data) => ({ category, data }))
-      );
+      jobs.push(tmdb("/movie/" + category, { page, language: "en-US" }).then((data) => ({ category, data })));
     }
   }
   const results = await Promise.allSettled(jobs);
@@ -73,24 +111,76 @@ async function buildPool() {
     }
   }
   if (!anyOk) {
-    // surface the real reason (for example a wrong key)
     const firstError = results.find((r) => r.status === "rejected");
     throw firstError ? firstError.reason : new Error("TMDB unavailable");
   }
   pool = { at: Date.now(), items: [...byId.values()] };
+  await getGenres().catch(() => {});
+  saveDisk();
+  prefetchTrailers(pool.items).catch(() => {}); // in the background
   return pool;
 }
 
-async function getPool() {
-  if (pool.items.length && Date.now() - pool.at < CACHE_MS) return pool;
-  if (!building) building = buildPool().finally(() => (building = null));
+function startBuild() {
+  if (!building) {
+    lastTry = Date.now();
+    building = buildPool().finally(() => (building = null));
+  }
   return building;
 }
 
-let genreCache = null;
+async function getPool() {
+  if (pool.items.length) {
+    // we have movies (fresh, or saved from earlier): use them right away,
+    // and quietly try to refresh in the background when they are old
+    if (Date.now() - pool.at > CACHE_MS && !building && Date.now() - lastTry > RETRY_MS) {
+      startBuild().catch((e) => console.warn("[movies] refresh failed, using the saved copy:", e.message));
+    }
+    return pool;
+  }
+  return startBuild(); // nothing saved yet: we have to wait for TMDB
+}
+
 async function getGenres() {
-  if (!genreCache) genreCache = (await tmdb("/genre/movie/list", { language: "en-US" })).genres;
+  if (genreCache) return genreCache;
+  genreCache = (await tmdb("/genre/movie/list", { language: "en-US" })).genres;
+  saveDisk();
   return genreCache;
+}
+
+// ---------- trailers ----------
+async function findTrailer(id, save = true) {
+  if (trailers[id]) return trailers[id];
+  const data = await tmdb(`/movie/${id}/videos`, { language: "en-US" });
+  const yt = (data.results || []).filter((v) => v.site === "YouTube");
+  const pick =
+    yt.find((v) => v.type === "Trailer" && v.official) ||
+    yt.find((v) => v.type === "Trailer") ||
+    yt.find((v) => v.type === "Teaser") ||
+    yt[0];
+  if (!pick) return null;
+  trailers[id] = { url: "https://www.youtube.com/watch?v=" + pick.key, name: pick.name };
+  if (save) saveDisk();
+  return trailers[id];
+}
+
+// Look up trailers for the most popular movies ahead of time, so they still work
+// later when TMDB can't be reached.
+async function prefetchTrailers(items) {
+  const ids = new Set();
+  for (const cat of ["popular", "top_rated", "now_playing"]) {
+    items
+      .filter((m) => m.categories.includes(cat))
+      .sort((a, b) => b.popularity - a.popularity)
+      .slice(0, 15)
+      .forEach((m) => ids.add(m.id));
+  }
+  const todo = [...ids].filter((id) => !trailers[id]);
+  for (let i = 0; i < todo.length; i += 10) {
+    await Promise.allSettled(todo.slice(i, i + 10).map((id) => findTrailer(id, false)));
+  }
+  saveDisk();
+  console.log(`[movies] saved ${Object.keys(trailers).length} trailers to ${path.basename(CACHE_FILE)}`);
 }
 
 function sendError(res, e) {
@@ -100,10 +190,17 @@ function sendError(res, e) {
     });
   }
   console.error("[movies]", e.message);
+  if (e.message.startsWith("NETWORK")) {
+    return res.status(502).json({
+      error: "Can't connect to TMDB (" + e.message.slice(8) + ") and there is no saved copy yet. Try another network or a VPN once, so it can be saved.",
+    });
+  }
   res.status(502).json({ error: "Could not reach TMDB (" + e.message + ")" });
 }
 
 module.exports = function registerMovieRoutes(app) {
+  loadDisk();
+
   app.get("/api/movies/genres", async (req, res) => {
     try {
       res.json({ genres: await getGenres() });
@@ -154,15 +251,9 @@ module.exports = function registerMovieRoutes(app) {
   app.get("/api/movies/:id/trailer", async (req, res) => {
     try {
       if (!/^\d+$/.test(req.params.id)) return res.status(400).json({ error: "Bad movie id" });
-      const data = await tmdb(`/movie/${req.params.id}/videos`, { language: "en-US" });
-      const yt = (data.results || []).filter((v) => v.site === "YouTube");
-      const pick =
-        yt.find((v) => v.type === "Trailer" && v.official) ||
-        yt.find((v) => v.type === "Trailer") ||
-        yt.find((v) => v.type === "Teaser") ||
-        yt[0];
-      if (!pick) return res.status(404).json({ error: "No trailer found for this movie" });
-      res.json({ url: "https://www.youtube.com/watch?v=" + pick.key, name: pick.name });
+      const t = await findTrailer(req.params.id);
+      if (!t) return res.status(404).json({ error: "No trailer found for this movie" });
+      res.json(t);
     } catch (e) {
       sendError(res, e);
     }

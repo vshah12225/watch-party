@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Watch Party - sync statistics</title>
+  <style>
+    body { font-family: sans-serif; max-width: 820px; margin: 24px auto; padding: 0 12px; }
+    table { border-collapse: collapse; width: 100%; margin: 10px 0 24px; }
+    th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: right; font-size: 14px; }
+    th:first-child, td:first-child { text-align: left; }
+    th { background: #f4f4f4; }
+    .pass { color: #1d8a42; font-weight: bold; }
+    .fail { color: #cc2f2f; font-weight: bold; }
+    .hint { color: #666; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h2>Sync statistics</h2>
+  <p class="hint" id="meta">Loading...</p>
+  <button id="reset">Reset (start a fresh measurement)</button>
+
+  <div id="out"></div>
+
+  <p class="hint">
+    <b>Drift</b> = how far a user's video is from where the room says it should be (absolute value, sampled every second while playing).<br />
+    <b>Round trip</b> = time for a message to reach the server and come back. <b>One way</b> is that divided by 2 and
+    approximates how long a play / pause / seek takes to reach a user.<br />
+    Targets from the task: drift p95 within 500 ms, control propagation p95 within 250 ms.
+  </p>
+
+  <script>
+    const fmt = (v) => (v === null || v === undefined ? "-" : v);
+    const name = { html5: "Direct video (.mp4)", yt: "YouTube" };
+
+    function row(label, s) {
+      return `<tr><td>${label}</td><td>${fmt(s && s.count)}</td><td>${fmt(s && s.mean)}</td><td>${fmt(s && s.p50)}</td><td>${fmt(s && s.p95)}</td><td>${fmt(s && s.p99)}</td><td>${fmt(s && s.max)}</td></tr>`;
+    }
+    const verdict = (ok) => ok === null ? "" : ok ? '<span class="pass">PASS</span>' : '<span class="fail">FAIL</span>';
+
+    async function refresh() {
+      try {
+        const d = await (await fetch("/api/stats")).json();
+        document.getElementById("meta").textContent = `Measuring since ${new Date(d.since).toLocaleTimeString()} (${d.minutes} min). Active rooms: ${d.activeRooms}. Updates every 2 seconds.`;
+        let html = "";
+        for (const [key, p] of Object.entries(d.players)) {
+          const driftOk = p.driftAbsMs ? p.driftAbsMs.p95 <= 500 : null;
+          const netOk = p.oneWayMsEstimate ? p.oneWayMsEstimate.p95 <= 250 : null;
+          html += `<h3 style="margin-bottom:0">${name[key]}</h3>
+            <p class="hint">Samples within 500 ms: <b>${fmt(p.percentWithin500ms)}%</b> of ${p.samples}</p>
+            <table><tr><th>Measurement (ms)</th><th>samples</th><th>mean</th><th>p50</th><th>p95</th><th>p99</th><th>max</th><th>target</th></tr>
+            ${row("Drift (absolute)", p.driftAbsMs).replace("</tr>", `<td>p95 &le; 500 ${verdict(driftOk)}</td></tr>`)}
+            ${row("Round trip", p.roundTripMs).replace("</tr>", "<td></td></tr>")}
+            ${row("One way (estimate)", p.oneWayMsEstimate).replace("</tr>", `<td>p95 &le; 250 ${verdict(netOk)}</td></tr>`)}
+            </table>`;
+        }
+        document.getElementById("out").innerHTML = html;
+      } catch (e) {
+        document.getElementById("meta").textContent = "Could not load statistics: " + e.message;
+      }
+    }
+    document.getElementById("reset").onclick = async () => { await fetch("/api/stats/reset", { method: "POST" }); refresh(); };
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
