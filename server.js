@@ -26,6 +26,8 @@ app.get("/room/:code", (req, res) =>
 const rooms = new Map(); // code -> room
    require("./health")(app, io, rooms);
 
+const presence = new Map(); // friend id -> Set of socket ids that have the site open
+
 function makeCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code;
@@ -37,14 +39,16 @@ function makeCode() {
   return code;
 }
 
-function createRoom(hostId) {
+function createRoom(hostId, isPublic) {
   const room = {
     code: makeCode(),
     hostId,
+    isPublic: !!isPublic, // true = shown in the public rooms list, false = only people with the code or link can join
     users: new Map(), // socket.id -> name
     nextId: 1, // used to give ids to playlist items and polls
     playlist: [], // { id, title, url, addedBy, addedById }
     poll: null, // see poll:create
+    banned: new Set(), // friend ids of people the host removed (they cannot come back)
     state: {
       videoUrl: DEFAULT_VIDEO,
       currentItemId: null, // which playlist item is playing (null = default video)
@@ -79,6 +83,7 @@ function snapshot(room) {
   return {
     code: room.code,
     hostId: room.hostId,
+    isPublic: room.isPublic,
     users: [...room.users].map(([id, name]) => ({ id, name })),
     playlist: room.playlist,
     poll: pollView(room),
@@ -133,8 +138,8 @@ io.on("connection", (socket) => {
     systemMessage(room, `${name || "Guest"} joined`);
   }
 
-  socket.on("room:create", ({ name } = {}, cb) => {
-    const r = createRoom(socket.id);
+  socket.on("room:create", ({ name, isPublic } = {}, cb) => {
+    const r = createRoom(socket.id, isPublic === true);
     enter(r, name);
     cb && cb({ ok: true, code: r.code });
   });
@@ -143,9 +148,26 @@ io.on("connection", (socket) => {
   socket.on("room:join", ({ code, name } = {}, cb) => {
     const r = rooms.get(String(code || "").toUpperCase());
     if (!r) return cb && cb({ ok: false, error: "Room not found" });
+    if (socket.data.fid && r.banned.has(socket.data.fid))
+      return cb && cb({ ok: false, error: "The host removed you from this room." });
     if (room) leave(); // in case of a double join
     enter(r, name);
     cb && cb({ ok: true, code: r.code });
+  });
+
+  // The lobby asks for the list of public rooms (private rooms are never listed)
+  socket.on("rooms:public", (cb) => {
+    if (typeof cb !== "function") return;
+    const list = [...rooms.values()]
+      .filter((r) => r.isPublic && r.users.size > 0)
+      .sort((a, b) => b.users.size - a.users.size)
+      .slice(0, 30)
+      .map((r) => ({
+        code: r.code,
+        host: r.users.get(r.hostId) || "Guest",
+        count: r.users.size,
+      }));
+    cb({ rooms: list });
   });
 
   // Anyone can ask for the latest state (used for drift checks)
@@ -301,6 +323,76 @@ io.on("connection", (socket) => {
     broadcast(room);
   });
 
+  // ----- friends: invites for people who have the site open -----
+  const FID = /^[A-Z2-9]{6}$/;
+  const lastInvite = new Map(); // friend id -> time of the last invite this host sent
+
+  function unregister() {
+    const f = socket.data.fid;
+    if (!f) return;
+    const set = presence.get(f);
+    if (set) {
+      set.delete(socket.id);
+      if (!set.size) presence.delete(f);
+    }
+    socket.data.fid = null;
+  }
+
+  // Every page says who it is (its Friend ID) when it connects
+  socket.on("presence:hello", ({ fid } = {}) => {
+    fid = String(fid || "").toUpperCase();
+    if (!FID.test(fid)) return;
+    if (socket.data.fid && socket.data.fid !== fid) unregister();
+    socket.data.fid = fid;
+    if (!presence.has(fid)) presence.set(fid, new Set());
+    presence.get(fid).add(socket.id);
+  });
+
+  // Which of these friend ids are online right now?
+  socket.on("friends:check", ({ ids } = {}, cb) => {
+    if (typeof cb !== "function") return;
+    const online = (Array.isArray(ids) ? ids : [])
+      .slice(0, 50)
+      .map((x) => String(x).toUpperCase())
+      .filter((f) => presence.has(f));
+    cb({ online });
+  });
+
+  // Host invites a friend: the friend's page shows a Join button
+  socket.on("friend:invite", ({ fid } = {}, cb) => {
+    const reply = (r) => typeof cb === "function" && cb(r);
+    if (!room) return reply({ ok: false, error: "Join a room first." });
+    if (room.hostId !== socket.id) return reply({ ok: false, error: "Only the host can send invites." });
+    fid = String(fid || "").toUpperCase();
+    if (!FID.test(fid)) return reply({ ok: false, error: "That Friend ID is not valid." });
+    if (fid === socket.data.fid) return reply({ ok: false, error: "That is your own Friend ID." });
+    if (room.banned.has(fid)) return reply({ ok: false, error: "You removed this person from the room." });
+    const sockets = presence.get(fid);
+    if (!sockets || !sockets.size)
+      return reply({ ok: false, error: "Your friend is offline. Send them the invite link instead." });
+    const targets = [...sockets].filter((id) => !room.users.has(id));
+    if (!targets.length) return reply({ ok: false, error: "Your friend is already in this room." });
+    if (Date.now() - (lastInvite.get(fid) || 0) < 3000)
+      return reply({ ok: false, error: "Invite already sent. Wait a few seconds." });
+    lastInvite.set(fid, Date.now());
+    const from = room.users.get(socket.id);
+    targets.forEach((id) => io.to(id).emit("invite:received", { code: room.code, from }));
+    reply({ ok: true });
+  });
+
+  // ----- host removes someone -----
+  socket.on("host:kick", ({ toId } = {}) => {
+    if (!room || room.hostId !== socket.id || toId === socket.id || !room.users.has(toId)) return;
+    const target = io.sockets.sockets.get(toId);
+    const name = room.users.get(toId);
+    if (target && target.data.fid) room.banned.add(target.data.fid);
+    systemMessage(room, `${name} was removed by the host`);
+    if (target) {
+      target.emit("room:kicked", { by: room.users.get(socket.id) });
+      target.disconnect(true); // their disconnect handler removes them from the room
+    }
+  });
+
   function leave() {
     if (!room) return;
     const r = room;
@@ -316,7 +408,10 @@ io.on("connection", (socket) => {
     broadcast(r);
   }
 
-  socket.on("disconnect", leave);
+  socket.on("disconnect", () => {
+    unregister();
+    leave();
+  });
 });
 
 const PORT = process.env.PORT || 3000;
