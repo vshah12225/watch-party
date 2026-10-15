@@ -12,6 +12,10 @@ const io = new Server(server);
 // false = everyone can (good for testing concurrent actions)
 const HOST_ONLY = false;
 
+// true  = only the host can pause (everyone else can still play and seek)
+// false = anyone can pause
+const HOST_ONLY_PAUSE = true;
+
 const DEFAULT_VIDEO =
   "https://www.youtube.com/watch?v=B6NVvtIz9_Q&t=2628s";
 
@@ -186,8 +190,17 @@ io.on("connection", (socket) => {
     });
   });
 
-  socket.on("playback:pause", ({ position } = {}) => {
+  // auto: true means the video simply reached its end (every client reports that),
+  // so a guest's copy of it is ignored quietly instead of being treated as a refused pause
+  socket.on("playback:pause", ({ position, auto } = {}) => {
     if (!canControl()) return;
+    if (HOST_ONLY_PAUSE && room.hostId !== socket.id) {
+      if (!auto) {
+        socket.emit("playback:denied", { action: "pause" }); // the guest's player goes back to the room's state
+        socket.emit("chat:system", "Only the host can pause the video.");
+      }
+      return;
+    }
     changeState(room, {
       isPlaying: false,
       position: Number.isFinite(position) ? position : currentPosition(room),

@@ -768,7 +768,7 @@
         const idx = state.playlist.findIndex((i) => i.id === state.currentItemId);
         if (idx === -1 || !state.playlist[idx + 1]) {
           // nothing after this video: pause so late joiners don't land past the end
-          socket.emit("playback:pause", { position: yt.getDuration() });
+          socket.emit("playback:pause", { position: yt.getDuration(), auto: true });
         }
       }
     }
@@ -1335,7 +1335,9 @@
 
     // ---- client -> server for the normal <video> (only when the USER did it) ----
     video.onplay   = () => mode === "html5" && !applying && socket.emit("playback:play",  { position: video.currentTime });
-    video.onpause  = () => mode === "html5" && !applying && socket.emit("playback:pause", { position: video.currentTime });
+    video.onpause  = () => mode === "html5" && !applying && socket.emit("playback:pause", { position: video.currentTime, auto: video.ended });
+    // the server said "only the host can pause": put this player back in step with the room
+    socket.on("playback:denied", () => { if (state) applyState(); });
     video.onseeking = () => { if (mode === "html5" && !applying) lastLocalSeekAt = Date.now(); };
     video.onseeked = () => {
       if (mode !== "html5" || applying) return;
