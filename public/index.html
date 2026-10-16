@@ -723,18 +723,29 @@
     }
 
     // ---- clock sync (a few pings, keep the one with the smallest round trip) ----
+    // Runs when we connect and again every 30 seconds. Each run pings 8 times and keeps the quickest
+    // answer (the most accurate one). We keep the last 5 runs and use the best of them, so one noisy
+    // moment on a mobile network cannot throw the clock estimate off.
+    const clockRuns = [];
     function syncClock() {
+      if (!socket.connected) return;
       let best = { rtt: Infinity, offset: 0 }, n = 0;
       (function ping() {
-        const t0 = Date.now();
+        const p0 = performance.now();
         socket.emit("time:ping", (serverTime) => {
-          const t1 = Date.now(), rtt = t1 - t0;
-          if (rtt < best.rtt) best = { rtt, offset: serverTime + rtt / 2 - t1 };
-          clockOffset = best.offset;
-          if (++n < 5) setTimeout(ping, 100);
+          const rtt = performance.now() - p0;
+          const offset = serverTime + rtt / 2 - Date.now();
+          if (rtt < best.rtt) best = { rtt, offset };
+          if (!clockRuns.length) clockOffset = best.offset; // first run: use it straight away
+          if (++n < 8) { setTimeout(ping, 120); return; }
+          clockRuns.push(best);
+          if (clockRuns.length > 5) clockRuns.shift();
+          clockOffset = clockRuns.reduce((a, b) => (b.rtt < a.rtt ? b : a)).offset;
+          dbg("clock offset " + Math.round(clockOffset) + " ms (best round trip " + Math.round(best.rtt) + " ms)");
         });
       })();
     }
+    setInterval(syncClock, 30000);
 
     // Where should the video be right now?
     function expectedPosition() {
@@ -1866,43 +1877,68 @@
     }
 
     // ---- drift correction, every second ----
+    // Every freeze you can see on a phone is a correction (a speed change or a jump). A phone on a
+    // mobile network measures time unevenly, so we never react to a single reading. Instead:
+    //   - we use the middle value of the last 3 readings,
+    //   - differences under 500 ms are ignored (the project target is 500 ms),
+    //   - a difference has to show up in all 3 readings before we fix it,
+    //   - and we only touch the player's speed when it actually has to change.
+    const driftHistory = [];
+    let driftVersion = -1, htmlLastHardSeek = 0;
+    function smoothDrift(driftMs) {
+      driftHistory.push(driftMs);
+      if (driftHistory.length > 3) driftHistory.shift();
+      const med = [...driftHistory].sort((x, y) => x - y)[Math.floor(driftHistory.length / 2)];
+      return { med, full: driftHistory.length === 3 };
+    }
     setInterval(() => {
-      if (!state || !state.isPlaying) return;
-      if (recentSeek()) return; // you just jumped: let the room catch up to you first
+      if (!state || !state.isPlaying || recentSeek()) { driftHistory.length = 0; return; }
+      if (state.version !== driftVersion) { driftVersion = state.version; driftHistory.length = 0; } // new play / seek / video: start counting again
 
       if (mode === "yt") {
         // YouTube only has fixed speeds (0.75x, 1x, 1.25x...), so we nudge with those
         // and only jump when we are far off (jumping makes YouTube re-buffer and freeze).
-        if (!ytReady || applying || yt.getPlayerState() !== 1) return;
+        if (!ytReady || applying || yt.getPlayerState() !== 1) { driftHistory.length = 0; return; }
         const driftMs = (yt.getCurrentTime() - expectedPosition()) * 1000;
         $("drift").textContent = Math.round(driftMs);
         report(driftMs, "yt");
-        const abs = Math.abs(driftMs);
-        if (abs > 2000 && Date.now() - ytLastHardSeek > 5000) {
+        const { med, full } = smoothDrift(driftMs);
+        const abs = Math.abs(med);
+        if (full && abs > 2500 && Date.now() - ytLastHardSeek > 8000) {
           ytLastHardSeek = Date.now();
-          dbg("far out of sync (" + Math.round(driftMs) + " ms) -> jumping");
+          dbg("far out of sync (" + Math.round(med) + " ms) -> jumping");
           applying = true;
           yt.seekTo(expectedPosition(), true);
           ytLast = { t: null, at: 0, ps: -1 };
+          driftHistory.length = 0;
           setTimeout(() => (applying = false), 800);
-        } else if (abs > 300) {
-          yt.setPlaybackRate(driftMs > 0 ? 0.75 : 1.25);
-        } else if (abs < 150) {
+        } else if (full && abs > 500) {
+          const rate = med > 0 ? 0.75 : 1.25;
+          if (yt.getPlaybackRate() !== rate) yt.setPlaybackRate(rate);
+        } else if (abs < 250 && yt.getPlaybackRate() !== 1) {
           yt.setPlaybackRate(1);
         }
         return;
       }
 
-      if (video.paused) return;
+      if (video.paused) { driftHistory.length = 0; return; }
       const driftMs = (video.currentTime - expectedPosition()) * 1000;
       $("drift").textContent = Math.round(driftMs);
       report(driftMs, "html5");
-      const abs = Math.abs(driftMs);
-      applying = true;
-      if (abs > 500) video.currentTime = expectedPosition();              // too far: jump
-      else if (abs > 200) video.playbackRate = driftMs > 0 ? 0.95 : 1.05; // small: slow down / speed up
-      else video.playbackRate = 1;                                         // fine
-      setTimeout(() => (applying = false), 300);
+      const { med, full } = smoothDrift(driftMs);
+      const abs = Math.abs(med);
+      if (full && abs > 1000 && Date.now() - htmlLastHardSeek > 5000) {
+        htmlLastHardSeek = Date.now();
+        applying = true;
+        video.currentTime = expectedPosition();                       // far off: jump
+        driftHistory.length = 0;
+        setTimeout(() => (applying = false), 500);
+      } else if (full && abs > 250) {
+        const rate = med > 0 ? 0.95 : 1.05;                           // a bit off: slow down / speed up a little
+        if (video.playbackRate !== rate) video.playbackRate = rate;
+      } else if (abs < 100 && video.playbackRate !== 1) {
+        video.playbackRate = 1;                                       // in sync: normal speed
+      }
     }, 1000);
 
     // coming back to a tab that was in the background: catch up with the room
