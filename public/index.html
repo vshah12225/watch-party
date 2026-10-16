@@ -211,6 +211,8 @@
     .popcorn-l { left: calc(var(--pw) * -.5); transform: rotate(45deg); }
     .popcorn-r { right: calc(var(--pw) * -.5); transform: rotate(-45deg); }
     .room-end { height: 120px; }
+    .lib-progress { height: 8px; border-radius: 999px; background: var(--raised); border: 1px solid var(--line); overflow: hidden; }
+    .lib-progress div { height: 100%; width: 0; background: var(--brass); transition: width .15s linear; }
     /* ---------- public / private choice + public rooms list ---------- */
     .modal { position: fixed; inset: 0; z-index: 950; display: grid; place-items: center; padding: 16px; background: rgba(8, 4, 6, .72); }
     .modal[hidden] { display: none; }
@@ -531,6 +533,7 @@
           <button class="tab active" role="tab" data-tab="chat" aria-selected="true">Chat <span class="badge" id="badgeChat"></span></button>
           <button class="tab" role="tab" data-tab="playlist" aria-selected="false">Playlist <span class="badge" id="badgePlaylist"></span></button>
           <button class="tab" role="tab" data-tab="movies" aria-selected="false">Movies</button>
+          <button class="tab" role="tab" data-tab="library" aria-selected="false">Library</button>
           <button class="tab" role="tab" data-tab="poll" aria-selected="false">Poll <span class="badge" id="badgePoll"></span></button>
           <button class="tab" role="tab" data-tab="friends" aria-selected="false">Friends <span class="badge" id="badgeFriends"></span></button>
         </div>
@@ -557,6 +560,17 @@
               <input id="plUrl" placeholder="YouTube link or .mp4 link" />
               <button id="plAdd" class="btn primary">Add</button>
             </div>
+          </div>
+        </div>
+
+        <!-- video library: upload downloaded videos and watch them together -->
+        <div class="pane" id="pane-library" role="tabpanel">
+          <div class="pane-body"><ul id="libList" class="list"></ul></div>
+          <div class="pane-form">
+            <input id="libFile" type="file" accept="video/mp4,video/webm,video/quicktime,video/ogg,.mp4,.m4v,.webm,.mov,.ogv" hidden />
+            <button id="libPick" class="btn primary">Upload a video</button>
+            <div id="libProgress" class="lib-progress" hidden><div id="libBar"></div></div>
+            <div id="libNote" class="muted small">MP4 or WebM files play best.</div>
           </div>
         </div>
 
@@ -1014,6 +1028,106 @@
       searchMovies();
       playCurtains();
     }
+    // ---- video library: upload downloaded videos, then play or queue them for the room ----
+    let libMaxMb = 3072, uploading = false;
+    const fmtLimit = (mb) => (mb >= 1024 ? (mb / 1024).toFixed(mb % 1024 ? 1 : 0) + " GB" : mb + " MB");
+    function fmtSize(n) {
+      if (n >= 1073741824) return (n / 1073741824).toFixed(1) + " GB";
+      if (n >= 1048576) return Math.round(n / 1048576) + " MB";
+      return Math.max(1, Math.round(n / 1024)) + " KB";
+    }
+    function renderLibrary(videos) {
+      const ul = $("libList");
+      ul.innerHTML = "";
+      if (!videos.length) {
+        const li = document.createElement("li");
+        li.className = "empty";
+        li.textContent = "No videos yet. Upload one below and everyone in the room can watch it.";
+        ul.append(li);
+        return;
+      }
+      videos.slice().reverse().forEach((v) => {
+        const li = document.createElement("li");
+        li.className = "pl-item";
+        const text = document.createElement("div");
+        text.className = "pl-text";
+        const title = document.createElement("div");
+        title.className = "pl-title";
+        title.textContent = v.title;
+        const meta = document.createElement("div");
+        meta.className = "muted small";
+        meta.textContent = "Uploaded by " + v.by + " · " + fmtSize(v.size);
+        text.append(title, meta);
+        const actions = document.createElement("div");
+        actions.className = "pl-actions";
+        actions.append(
+          btn("Play", () => socket.emit("library:play", { id: v.id })),
+          btn("Queue", () => { socket.emit("library:queue", { id: v.id }); toast("Added to the playlist"); })
+        );
+        if (myFid && v.owner === myFid) {
+          actions.append(btn("Delete", async () => {
+            if (!confirm("Delete \"" + v.title + "\" for everyone?")) return;
+            try {
+              const r = await fetch("/api/library/" + v.id, { method: "DELETE", headers: { "x-owner": myFid } });
+              if (!r.ok) toast((await r.json()).error || "Could not delete it");
+            } catch (e) { toast("Could not delete it"); }
+          }, "btn small"));
+        }
+        li.append(text, actions);
+        ul.append(li);
+      });
+    }
+    async function loadLibrary() {
+      try {
+        const r = await fetch("/api/library");
+        const data = await r.json();
+        libMaxMb = data.maxMb || libMaxMb;
+        if (!uploading) $("libNote").textContent = "MP4 or WebM files play best. Up to " + fmtLimit(libMaxMb) + " each.";
+        renderLibrary(data.videos || []);
+      } catch (e) { /* offline: keep what is shown */ }
+    }
+    socket.on("library:changed", loadLibrary);
+
+    $("libPick").onclick = () => { if (!uploading) $("libFile").click(); };
+    $("libFile").onchange = () => {
+      const file = $("libFile").files[0];
+      $("libFile").value = "";
+      if (!file || uploading) return;
+      if (file.size > libMaxMb * 1048576) { toast("That file is over " + fmtLimit(libMaxMb)); return; }
+      if (!/\.(mp4|m4v|webm|mov|ogv)$/i.test(file.name)) { toast("Use an .mp4, .webm, .mov, .m4v or .ogv file"); return; }
+      uploading = true;
+      $("libPick").disabled = true;
+      $("libProgress").hidden = false;
+      $("libBar").style.width = "0%";
+      const done = (msg) => {
+        uploading = false;
+        $("libPick").disabled = false;
+        $("libProgress").hidden = true;
+        $("libNote").textContent = msg || "";
+        loadLibrary();
+      };
+      const xhr = new XMLHttpRequest();
+      xhr.open("PUT", "/api/library/upload?name=" + encodeURIComponent(file.name));
+      xhr.setRequestHeader("x-room-code", state ? state.code : "");
+      xhr.setRequestHeader("x-owner", myFid || "");
+      xhr.setRequestHeader("x-name", encodeURIComponent(myName || "Guest"));
+      xhr.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        const pct = Math.round((e.loaded / e.total) * 100);
+        $("libBar").style.width = pct + "%";
+        $("libNote").textContent = "Uploading " + file.name + "… " + pct + "%";
+      };
+      xhr.onload = () => {
+        if (xhr.status === 200) { toast("Uploaded"); return done("Uploaded. Press Play to watch it together."); }
+        let msg = "Upload failed";
+        try { msg = JSON.parse(xhr.responseText).error || msg; } catch (e) {}
+        toast(msg);
+        done(msg);
+      };
+      xhr.onerror = () => { toast("Upload failed. Check your connection."); done("Upload failed. Check your connection."); };
+      xhr.send(file);
+    };
+
     // clicking "Create a room" first asks: public or private?
     function goCreate() {
       $("lobbyError").textContent = "";
@@ -1109,6 +1223,7 @@
       document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("active", p.id === "pane-" + name));
       if (name === "chat") { unread = 0; renderBadges(); }
       if (name === "friends") refreshPresence();
+      if (name === "library") loadLibrary();
     }
     document.querySelectorAll(".tab").forEach((t) => (t.onclick = () => showTab(t.dataset.tab)));
 

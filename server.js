@@ -2,6 +2,8 @@
 const express = require("express");
 const http = require("http");
 const path = require("path");
+const fs = require("fs");
+const crypto = require("crypto");
 const { Server } = require("socket.io");
 
 const app = express();
@@ -12,9 +14,9 @@ const io = new Server(server);
 // false = everyone can (good for testing concurrent actions)
 const HOST_ONLY = false;
 
-// true  = only the host can pause (everyone else can still play and seek)
-// false = anyone can pause
-const HOST_ONLY_PAUSE = true;
+// true  = only the host can pause and unpause (everyone else can still seek and pick videos)
+// false = anyone in the room can pause and unpause
+const HOST_ONLY_PLAY_PAUSE = true;
 
 const DEFAULT_VIDEO =
   "https://www.youtube.com/watch?v=B6NVvtIz9_Q&t=2628s";
@@ -29,6 +31,111 @@ app.get("/room/:code", (req, res) =>
 // ---------- Room storage (in memory) ----------
 const rooms = new Map(); // code -> room
    require("./health")(app, io, rooms);
+
+// ---------- Video library (uploaded videos, kept on disk + a small JSON "database") ----------
+// On a host with a temporary disk (Render free, etc.) set DATA_DIR to a persistent disk, or uploads are lost on restart.
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+const MEDIA_DIR = path.join(DATA_DIR, "media");
+const LIB_FILE = path.join(DATA_DIR, "library.json");
+const MAX_UPLOAD = (Number(process.env.MAX_UPLOAD_MB) || 3072) * 1024 * 1024;       // one file (3 GB)
+const MAX_LIBRARY = (Number(process.env.MAX_LIBRARY_GB) || 10) * 1024 * 1024 * 1024; // all files together (10 GB)
+const VIDEO_TYPES = { ".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime", ".ogv": "video/ogg" };
+fs.mkdirSync(MEDIA_DIR, { recursive: true });
+
+let library = []; // { id, title, file, size, owner (friend id), by (name), addedAt }
+try { library = JSON.parse(fs.readFileSync(LIB_FILE, "utf8")); } catch (e) { library = []; }
+library = library.filter((v) => fs.existsSync(path.join(MEDIA_DIR, v.file))); // forget entries whose file is gone
+
+function saveLibrary() {
+  const tmp = LIB_FILE + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(library));
+  fs.renameSync(tmp, LIB_FILE); // swap in one step so a crash never leaves a half-written file
+}
+const libraryUrl = (v) => "/media/" + v.file;
+const libraryTotal = () => library.reduce((n, v) => n + v.size, 0);
+const libraryByUrl = (url) => library.find((v) => libraryUrl(v) === url);
+
+// the files themselves (express.static also supports seeking, which the video player needs)
+app.use("/media", express.static(MEDIA_DIR, {
+  index: false,
+  dotfiles: "deny",
+  setHeaders: (res) => res.setHeader("X-Content-Type-Options", "nosniff"),
+}));
+
+app.get("/api/library", (req, res) => {
+  res.json({
+    maxMb: Math.round(MAX_UPLOAD / 1024 / 1024),
+    videos: library.map((v) => ({ id: v.id, title: v.title, size: v.size, owner: v.owner, by: v.by, addedAt: v.addedAt, url: libraryUrl(v) })),
+  });
+});
+
+// Upload: the browser sends the raw file as the request body (PUT), we stream it to disk.
+// Only people who are inside a room can upload.
+app.put("/api/library/upload", (req, res) => {
+  const reject = (code, msg) => { res.set("Connection", "close"); res.status(code).json({ error: msg }); };
+  const code = String(req.get("x-room-code") || "").toUpperCase();
+  if (!rooms.has(code)) return reject(403, "Join a room first, then upload.");
+  const name = String(req.query.name || "video").slice(0, 150);
+  const ext = path.extname(name).toLowerCase();
+  if (!VIDEO_TYPES[ext]) return reject(415, "Use an .mp4, .webm, .mov, .m4v or .ogv file.");
+  const size = Number(req.get("content-length"));
+  if (!Number.isFinite(size) || size <= 0) return reject(411, "Empty or unknown file size.");
+  if (size > MAX_UPLOAD) return reject(413, "That file is too big (limit " + Math.round(MAX_UPLOAD / 1024 / 1024) + " MB).");
+  if (libraryTotal() + size > MAX_LIBRARY) return reject(507, "The video library is full. Delete a video first.");
+
+  const id = crypto.randomBytes(6).toString("hex");
+  const file = id + ext;
+  const dest = path.join(MEDIA_DIR, file);
+  const out = fs.createWriteStream(dest);
+  let received = 0, failed = false;
+  const fail = (code2, msg) => {
+    if (failed) return;
+    failed = true;
+    out.destroy();
+    fs.unlink(dest, () => {});
+    if (!res.headersSent) reject(code2, msg);
+  };
+  req.on("data", (chunk) => { received += chunk.length; if (received > size || received > MAX_UPLOAD) { req.unpipe(out); fail(413, "Upload was larger than announced."); } });
+  req.on("aborted", () => fail(499, "Upload cancelled."));
+  req.on("error", () => fail(500, "Upload failed."));
+  out.on("error", () => fail(500, "Could not save the file."));
+  out.on("finish", () => {
+    if (failed) return;
+    if (received !== size) return fail(400, "Upload was incomplete.");
+    const entry = {
+      id,
+      title: path.basename(name, ext).replace(/[_]+/g, " ").trim().slice(0, 100) || "Untitled video",
+      file,
+      size,
+      owner: String(req.get("x-owner") || "").toUpperCase().slice(0, 6),
+      by: decodeURIComponent(String(req.get("x-name") || "Guest")).slice(0, 24) || "Guest",
+      addedAt: Date.now(),
+    };
+    library.push(entry);
+    saveLibrary();
+    io.emit("library:changed");
+    res.json({ ok: true, id });
+  });
+  req.pipe(out);
+});
+
+// Delete: only the browser that uploaded it (same Friend ID) can remove it
+app.delete("/api/library/:id", (req, res) => {
+  const v = library.find((x) => x.id === req.params.id);
+  if (!v) return res.status(404).json({ error: "Video not found." });
+  const owner = String(req.get("x-owner") || "").toUpperCase();
+  if (!owner || owner !== v.owner) return res.status(403).json({ error: "Only the person who uploaded it can delete it." });
+  library = library.filter((x) => x.id !== v.id);
+  saveLibrary();
+  fs.unlink(path.join(MEDIA_DIR, v.file), () => {});
+  rooms.forEach((r) => { // take it out of every playlist too
+    const before = r.playlist.length;
+    r.playlist = r.playlist.filter((i) => i.url !== libraryUrl(v));
+    if (r.playlist.length !== before) broadcast(r);
+  });
+  io.emit("library:changed");
+  res.json({ ok: true });
+});
 
 const presence = new Map(); // friend id -> Set of socket ids that have the site open
 
@@ -182,25 +289,28 @@ io.on("connection", (socket) => {
   }
 
   // ----- playback -----
-  socket.on("playback:play", ({ position } = {}) => {
-    if (!canControl()) return;
+  // Guests may not pause or unpause when HOST_ONLY_PLAY_PAUSE is on.
+  // auto: true means the video simply reached its end (every client reports that),
+  // so a guest's copy of it is ignored quietly instead of being treated as a refused action.
+  function guestBlocked(auto) {
+    if (!HOST_ONLY_PLAY_PAUSE || room.hostId === socket.id) return false;
+    if (!auto) {
+      socket.emit("playback:denied", {}); // the guest's player goes back to the room's state
+      socket.emit("chat:system", "Only the host can pause or unpause the video.");
+    }
+    return true;
+  }
+
+  socket.on("playback:play", ({ position, auto } = {}) => {
+    if (!canControl() || guestBlocked(auto)) return;
     changeState(room, {
       isPlaying: true,
       position: Number.isFinite(position) ? position : currentPosition(room),
     });
   });
 
-  // auto: true means the video simply reached its end (every client reports that),
-  // so a guest's copy of it is ignored quietly instead of being treated as a refused pause
   socket.on("playback:pause", ({ position, auto } = {}) => {
-    if (!canControl()) return;
-    if (HOST_ONLY_PAUSE && room.hostId !== socket.id) {
-      if (!auto) {
-        socket.emit("playback:denied", { action: "pause" }); // the guest's player goes back to the room's state
-        socket.emit("chat:system", "Only the host can pause the video.");
-      }
-      return;
-    }
+    if (!canControl() || guestBlocked(auto)) return;
     changeState(room, {
       isPlaying: false,
       position: Number.isFinite(position) ? position : currentPosition(room),
@@ -216,7 +326,7 @@ io.on("connection", (socket) => {
   socket.on("playlist:add", ({ title, url } = {}) => {
     if (!room) return;
     url = String(url || "").trim();
-    if (!/^https?:\/\//i.test(url)) return; // only http(s) links
+    if (!/^https?:\/\//i.test(url) && !libraryByUrl(url)) return; // only http(s) links or videos from our library
     if (room.playlist.length >= 50) return;
     room.playlist.push({
       id: room.nextId++,
@@ -226,6 +336,28 @@ io.on("connection", (socket) => {
       addedById: socket.id,
     });
     broadcast(room);
+  });
+
+  // ----- video library: put an uploaded video in the playlist, or play it right away -----
+  function queueLibraryVideo(v) {
+    const url = libraryUrl(v);
+    let item = room.playlist.find((i) => i.url === url);
+    if (item) return item; // already queued
+    if (room.playlist.length >= 50) return null;
+    item = { id: room.nextId++, title: v.title, url, addedBy: room.users.get(socket.id), addedById: socket.id };
+    room.playlist.push(item);
+    return item;
+  }
+  socket.on("library:queue", ({ id } = {}) => {
+    if (!room) return;
+    const v = library.find((x) => x.id === id);
+    if (v && queueLibraryVideo(v)) broadcast(room);
+  });
+  socket.on("library:play", ({ id } = {}) => {
+    if (!canControl()) return;
+    const v = library.find((x) => x.id === id);
+    const item = v && queueLibraryVideo(v);
+    if (item) playItem(room, item); // this also broadcasts
   });
 
   socket.on("playlist:remove", ({ id } = {}) => {
