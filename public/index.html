@@ -252,6 +252,7 @@
     .modal-label { font-weight: 600; font-size: 14px; }
     .modal-card input { color: var(--ink); background: rgba(42, 26, 20, .06); border-color: rgba(42, 26, 20, .28); }
     .modal-card input::placeholder { color: rgba(42, 26, 20, .5); }
+    .leave-btn:hover, .leave-btn:focus-visible { border-color: var(--bad); color: var(--bad); }
     .room-name { flex: 1; text-align: center; font: 600 22px/1.2 var(--display); padding: 0 12px; overflow-wrap: anywhere; }
     @media (max-width: 980px) {
       .lobby-grid { grid-template-columns: 1fr; }
@@ -524,6 +525,7 @@
         <span id="roomVis" class="vis-badge"></span>
         <button id="copyLink" class="btn ink small">Copy invite link</button>
       </div>
+      <button id="leaveRoom" class="btn small leave-btn">Leave room</button>
     </header>
 
     <div class="layout">
@@ -1175,7 +1177,7 @@
       $("visModal").hidden = true;
       myName = $("name").value.trim() || "Guest";
       justCreated = true;
-      socket.emit("room:create", { name: myName, isPublic, roomName: $("roomNameIn").value.trim() }, enterRoom);
+      socket.emit("room:create", { name: myName, isPublic, roomName: $("roomNameIn").value.trim(), fid: myFid }, enterRoom);
       $("roomNameIn").value = "";
     }
     $("pickPublic").onclick = () => createWithVisibility(true);
@@ -1187,7 +1189,7 @@
     // lists of public and private rooms on the home page
     function joinFromList(r, code, showError) {
       myName = $("name").value.trim() || "Guest";
-      socket.emit("room:join", { code, rid: r.rid, name: myName }, (res) => {
+      socket.emit("room:join", { code, rid: r.rid, name: myName, fid: myFid }, (res) => {
         if (res && res.ok) enterRoom(res); else showError((res && res.error) || "Could not join.");
       });
     }
@@ -1269,7 +1271,7 @@
       const code = $("code").value.trim();
       if (!code) { $("lobbyError").textContent = "Enter a room code to join."; return; }
       $("lobbyError").textContent = "";
-      socket.emit("room:join", { code, name: myName }, enterRoom);
+      socket.emit("room:join", { code, name: myName, fid: myFid }, enterRoom);
     }
     $("create").onclick = goCreate;
     $("join").onclick = goJoin;
@@ -1300,7 +1302,9 @@
       syncClock();
       lastVersion = -1; // force a fresh sync of the video after (re)connecting
       if (myRoom) {
-        socket.emit("room:join", { code: myRoom, name: myName }, () => {});
+        socket.emit("room:join", { code: myRoom, name: myName, fid: myFid }, (res) => {
+          if (!res || !res.ok) backToLobby(res && res.error === "Room not found" ? "That room has closed." : (res && res.error) || "");
+        });
         toast("Back online.");
       }
     });
@@ -1479,6 +1483,7 @@
       state = s;
       $("roomVis").textContent = s.isPublic ? "Public" : "Private";
       $("roomName").textContent = s.name || "";
+      $("leaveRoom").textContent = s.hostId === socket.id ? "Close room" : "Leave room";
       if (s.name) document.title = s.name + " - Watch Party";
       if (s.code !== lastCode) {
         // a different room (joined from an invite): start with a clean chat and a fresh video sync
@@ -1685,7 +1690,8 @@
     ["mvCat", "mvGenre", "mvRating"].forEach((id) => ($(id).onchange = searchMovies));
 
     // ---- removed by the host ----
-    socket.on("room:kicked", (d) => {
+    // ---- back to the lobby (left, room closed, or removed) ----
+    function backToLobby(message) {
       myRoom = null; state = null; health = null; lastVersion = -1; lastCode = null; unread = 0;
       applying = true; // our own pausing below must not be sent as a user action
       video.pause();
@@ -1697,9 +1703,23 @@
       $("lobby").style.display = "";
       $("code").value = "";
       $("inviteNote").hidden = true;
-      $("lobbyError").textContent = (d && d.by ? d.by : "The host") + " removed you from the room.";
+      $("lobbyError").textContent = message || "";
       history.replaceState(null, "", "/");
       document.title = "Watch Party";
+      loadRooms();
+    }
+
+    // the "Leave room" button; for the host it closes the room for everybody
+    $("leaveRoom").onclick = () => {
+      const iAmHost = !!state && state.hostId === socket.id;
+      if (iAmHost && !confirm("You are the host, so leaving closes the room for everyone. Close the room?")) return;
+      socket.emit("room:leave", () => backToLobby(iAmHost ? "Your room was closed." : ""));
+    };
+    socket.on("room:closed", (d) => backToLobby((d && d.message) || "The host closed the room."));
+
+    // ---- removed by the host ----
+    socket.on("room:kicked", (d) => {
+      backToLobby((d && d.by ? d.by : "The host") + " removed you from the room.");
       setTimeout(() => socket.connect(), 300); // the server closed our connection, so reconnect for the lobby
     });
 
@@ -1823,7 +1843,7 @@
         card.remove();
         if (myRoom === code) return;
         myName = myName || $("name").value.trim() || "Guest";
-        socket.emit("room:join", { code, name: myName }, (res) => {
+        socket.emit("room:join", { code, name: myName, fid: myFid }, (res) => {
           if (!res.ok) toast(res.error === "Room not found" ? "That room has closed." : res.error);
           else enterRoom(res);
         });

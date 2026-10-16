@@ -19,6 +19,10 @@ const HOST_ONLY = false;
 // false = anyone in the room can pause and unpause
 const HOST_ONLY_PLAY_PAUSE = true;
 
+// When the host's connection drops (closed tab, bad Wi-Fi) the room waits this long for them to come back.
+// If they press Leave / Close room themselves, the room closes at once.
+const HOST_GRACE_MS = Number(process.env.HOST_GRACE_MS) || 15000;
+
 const DEFAULT_VIDEO =
   "https://www.youtube.com/watch?v=B6NVvtIz9_Q&t=2628s";
 
@@ -169,6 +173,8 @@ function createRoom(hostId, isPublic, roomName) {
     rid: crypto.randomBytes(4).toString("hex"), // public id of the room, safe to show in lists (the code is the secret)
     name: roomName,
     hostId,
+    hostFid: null, // Friend ID of the host, so the same person can take the host seat back after a dropped connection
+    closeTimer: null, // set while we wait for a host whose connection dropped
     isPublic: !!isPublic, // true = shown in the public rooms list, false = only people with the code or link can join
     users: new Map(), // socket.id -> name
     nextId: 1, // used to give ids to playlist items and polls
@@ -250,6 +256,19 @@ function systemMessage(room, text) {
   io.to(room.code).emit("chat:system", text);
 }
 
+// The host left: tell everyone, take them all out of the room, and delete the room
+function closeRoom(r, message) {
+  clearTimeout(r.closeTimer);
+  r.closeTimer = null;
+  rooms.delete(r.code);
+  io.to(r.code).emit("room:closed", { message });
+  [...r.users.keys()].forEach((id) => {
+    const s = io.sockets.sockets.get(id);
+    if (s && s.data.leaveQuietly) s.data.leaveQuietly();
+  });
+  r.users.clear();
+}
+
 // ---------- Socket events ----------
 io.on("connection", (socket) => {
   let room = null;
@@ -265,22 +284,35 @@ io.on("connection", (socket) => {
     systemMessage(room, `${name || "Guest"} joined`);
   }
 
-  socket.on("room:create", ({ name, isPublic, roomName } = {}, cb) => {
+  socket.on("room:create", ({ name, isPublic, roomName, fid } = {}, cb) => {
+    adoptFid(fid);
     const hostName = String(name || "Guest").trim().slice(0, 24) || "Guest";
     const r = createRoom(socket.id, isPublic === true, cleanRoomName(roomName) || hostName + "'s room");
+    r.hostFid = socket.data.fid || null;
+    if (room) leave("button"); // creating a room means leaving the old one
     enter(r, name);
     cb && cb({ ok: true, code: r.code });
   });
 
   // Also used for late joins AND reconnects (client calls it again on reconnect)
-  socket.on("room:join", ({ code, name, rid } = {}, cb) => {
+  socket.on("room:join", ({ code, name, rid, fid } = {}, cb) => {
+    adoptFid(fid); // before the ban check: on a reconnect this message can arrive before presence:hello
     const r = rooms.get(String(code || "").toUpperCase());
     if (!r) return cb && cb({ ok: false, error: rid ? "That code is not right." : "Room not found" });
     if (rid && r.rid !== rid) return cb && cb({ ok: false, error: "That code is not right for this room." });
     if (socket.data.fid && r.banned.has(socket.data.fid))
       return cb && cb({ ok: false, error: "The host removed you from this room." });
-    if (room) leave(); // in case of a double join
+    if (room === r) return cb && cb({ ok: true, code: r.code }); // already inside this room
+    if (room) leave("button"); // joining another room means leaving this one
+    // the host's connection dropped a moment ago and the same person is back: give the seat back
+    const hostIsBack = !!r.closeTimer && !!socket.data.fid && r.hostFid === socket.data.fid;
+    if (hostIsBack) {
+      clearTimeout(r.closeTimer);
+      r.closeTimer = null;
+      r.hostId = socket.id;
+    }
     enter(r, name);
+    if (hostIsBack) systemMessage(r, "The host is back.");
     cb && cb({ ok: true, code: r.code });
   });
 
@@ -489,6 +521,8 @@ io.on("connection", (socket) => {
   socket.on("host:transfer", ({ toId } = {}) => {
     if (!room || room.hostId !== socket.id || !room.users.has(toId)) return;
     room.hostId = toId;
+    const newHost = io.sockets.sockets.get(toId);
+    room.hostFid = (newHost && newHost.data.fid) || null;
     broadcast(room);
   });
 
@@ -508,14 +542,15 @@ io.on("connection", (socket) => {
   }
 
   // Every page says who it is (its Friend ID) when it connects
-  socket.on("presence:hello", ({ fid } = {}) => {
-    fid = String(fid || "").toUpperCase();
-    if (!FID.test(fid)) return;
-    if (socket.data.fid && socket.data.fid !== fid) unregister();
-    socket.data.fid = fid;
-    if (!presence.has(fid)) presence.set(fid, new Set());
-    presence.get(fid).add(socket.id);
-  });
+  function adoptFid(raw) {
+    const f = String(raw || "").toUpperCase();
+    if (!FID.test(f) || socket.data.fid === f) return;
+    if (socket.data.fid) unregister();
+    socket.data.fid = f;
+    if (!presence.has(f)) presence.set(f, new Set());
+    presence.get(f).add(socket.id);
+  }
+  socket.on("presence:hello", ({ fid } = {}) => adoptFid(fid));
 
   // Which of these friend ids are online right now?
   socket.on("friends:check", ({ ids } = {}, cb) => {
@@ -555,6 +590,7 @@ io.on("connection", (socket) => {
     const target = io.sockets.sockets.get(toId);
     const name = room.users.get(toId);
     if (target && target.data.fid) room.banned.add(target.data.fid);
+    if (target) target.data.kicked = true;
     systemMessage(room, `${name} was removed by the host`);
     if (target) {
       target.emit("room:kicked", { by: room.users.get(socket.id) });
@@ -562,24 +598,53 @@ io.on("connection", (socket) => {
     }
   });
 
-  function leave() {
+  // how: "button" = they chose to leave, "disconnect" = connection dropped or tab closed
+  function leave(how) {
     if (!room) return;
     const r = room;
     room = null;
+    const name = r.users.get(socket.id) || "Someone";
+    const wasHost = r.hostId === socket.id;
     r.users.delete(socket.id);
     if (r.poll) r.poll.votes.delete(socket.id); // their vote leaves with them
     socket.leave(r.code);
     if (r.users.size === 0) {
+      clearTimeout(r.closeTimer);
       rooms.delete(r.code);
       return;
     }
-    if (r.hostId === socket.id) r.hostId = [...r.users.keys()][0]; // next user becomes host
+    if (wasHost) {
+      if (how === "disconnect") {
+        // might only be a dropped connection: wait a moment for the host to come back
+        clearTimeout(r.closeTimer);
+        r.closeTimer = setTimeout(() => closeRoom(r, "The host left, so the room was closed."), HOST_GRACE_MS);
+        systemMessage(r, `${name} lost connection. The room closes in ${Math.round(HOST_GRACE_MS / 1000)} seconds unless the host comes back.`);
+        return broadcast(r);
+      }
+      return closeRoom(r, `${name} ended the room.`); // the host chose to leave: the room closes now
+    }
+    if (!socket.data.kicked) systemMessage(r, `${name} left`);
     broadcast(r);
   }
 
+  // used when the room closes: drop this person from it without any more messages
+  socket.data.leaveQuietly = () => {
+    if (!room) return;
+    const r = room;
+    room = null;
+    r.users.delete(socket.id);
+    socket.leave(r.code);
+  };
+
+  socket.on("room:leave", (cb) => {
+    const wasHost = !!room && room.hostId === socket.id;
+    leave("button");
+    if (typeof cb === "function") cb({ ok: true, closed: wasHost });
+  });
+
   socket.on("disconnect", () => {
     unregister();
-    leave();
+    leave("disconnect");
   });
 });
 
