@@ -38,4 +38,4 @@ Movie data	TMDB API, Fuse.js for fuzzy search
 Frontend	One HTML file with plain JavaScript, the YouTube IFrame Player API and the HTML5 video element
 Storage	In memory for rooms; files on disk plus a small JSON file for the video library and the movie cache
 
-website link for render: https://watch-party-wlly.onrender.com/ 
+website link for watch party: https://watch-party-wlly.onrender.com/ 
