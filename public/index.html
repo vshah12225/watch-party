@@ -66,7 +66,7 @@
     /* ---------- lobby ---------- */
     .lobby { min-height: 100vh; display: grid; place-items: center; padding: 32px 16px;
              background: radial-gradient(ellipse 55% 45% at 50% 0%, rgba(217, 164, 65, .18), transparent 70%), var(--velvet); }
-    .lobby-inner { width: min(760px, 100%); }
+    .lobby-inner { width: min(1100px, 100%); }
     .brand-xl { font: 800 clamp(64px, 12vw, 132px)/.88 var(--display); letter-spacing: -.01em; }
     .lede { font-size: 18px; color: var(--muted); margin: 14px 0 28px; max-width: 46ch; }
     .invite { margin: -10px 0 22px; color: var(--brass); font-weight: 500; }
@@ -234,6 +234,29 @@
     .pub-host { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
     .pub-count { color: var(--muted); font-size: 13px; white-space: nowrap; }
     .pub-empty { color: var(--muted); margin: 6px 0 0; }
+
+    /* room lists beside the ticket, and room names */
+    .lobby-grid { display: grid; grid-template-columns: minmax(0, 680px) minmax(300px, 1fr); gap: 28px; align-items: start; }
+    .rooms-panel { background: var(--seat); border: 1px solid var(--line); border-radius: 14px; padding: 16px 16px 18px; max-height: 76vh; overflow-y: auto; }
+    .rooms-panel .pub-head { margin-bottom: 0; }
+    .rooms-sub { margin: 16px 0 8px; font: 600 18px/1.2 var(--display); letter-spacing: .02em; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+    .rooms-sub .small { font-family: var(--body); font-weight: 400; letter-spacing: 0; }
+    .pub-list .room-row { flex-wrap: wrap; gap: 8px 12px; }
+    .room-main { flex: 1; min-width: 0; }
+    .room-name-text { font-weight: 600; overflow-wrap: anywhere; }
+    .room-meta { color: var(--muted); font-size: 13px; }
+    .room-join { display: flex; gap: 6px; width: 100%; }
+    .room-join input { flex: 1; min-width: 0; text-transform: uppercase; letter-spacing: .1em; }
+    .room-err { width: 100%; color: var(--bad); font-size: 13px; }
+    .room-err:empty { display: none; }
+    .modal-label { font-weight: 600; font-size: 14px; }
+    .modal-card input { color: var(--ink); background: rgba(42, 26, 20, .06); border-color: rgba(42, 26, 20, .28); }
+    .modal-card input::placeholder { color: rgba(42, 26, 20, .5); }
+    .room-name { flex: 1; text-align: center; font: 600 22px/1.2 var(--display); padding: 0 12px; overflow-wrap: anywhere; }
+    @media (max-width: 980px) {
+      .lobby-grid { grid-template-columns: 1fr; }
+      .rooms-panel { max-height: none; }
+    }
 
     /* ---------- popcorn burst when a video ends ---------- */
     .popburst { position: fixed; inset: 0; z-index: 7; pointer-events: none; overflow: hidden; }
@@ -444,6 +467,8 @@
       <p class="lede">Watch videos together, in sync. Start a room, share the link, and press play.</p>
       <p class="invite" id="inviteNote" hidden></p>
 
+      <div class="lobby-grid">
+        <div class="lobby-left">
       <div class="ticket">
         <div class="ticket-main">
           <label for="name">Your name</label>
@@ -457,19 +482,28 @@
         </div>
       </div>
       <p id="lobbyError" class="error" role="alert"></p>
-      <section class="pubrooms" aria-labelledby="pubTitle">
-        <div class="pub-head"><h2 id="pubTitle">Public rooms</h2><button id="pubRefresh" class="btn tiny">Refresh</button></div>
-        <ul id="pubList" class="pub-list"></ul>
-        <p id="pubEmpty" class="pub-empty">No public rooms right now. Create one and pick Public!</p>
-      </section>
       <p class="myid">Your Friend ID <b id="myFidLobby"></b> <button id="copyFidLobby" class="btn tiny">Copy</button> <span>Share it with a friend so they can invite you straight into their room.</span></p>
+        </div>
+        <section class="rooms-panel" aria-labelledby="roomsTitle">
+          <div class="pub-head"><h2 id="roomsTitle">Rooms</h2><button id="pubRefresh" class="btn tiny">Refresh</button></div>
+          <h3 class="rooms-sub">Public rooms <span class="muted small">Join with one click</span></h3>
+          <ul id="pubList" class="pub-list"></ul>
+          <p id="pubEmpty" class="pub-empty">No public rooms right now.</p>
+          <h3 class="rooms-sub">Private rooms <span class="muted small">You need the room code</span></h3>
+          <ul id="privList" class="pub-list"></ul>
+          <p id="privEmpty" class="pub-empty">No private rooms right now.</p>
+        </section>
+      </div>
     </div>
   </main>
 
   <!-- ============ public or private? ============ -->
   <div id="visModal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="visTitle">
     <div class="modal-card">
-      <h2 id="visTitle">Who can join your room?</h2>
+      <h2 id="visTitle">Name your room</h2>
+      <label for="roomNameIn" class="modal-label">Room name (optional)</label>
+      <input id="roomNameIn" maxlength="32" autocomplete="off" placeholder="Friday movie night" />
+      <div class="modal-label">Who can join?</div>
       <button id="pickPublic" class="vis-opt"><b>Public</b><span>Listed in "Public rooms" on the home page. Anyone can join.</span></button>
       <button id="pickPrivate" class="vis-opt"><b>Private</b><span>Not listed. Only people with your room code or invite link can join.</span></button>
       <button id="visCancel" class="btn ghost-ink">Cancel</button>
@@ -483,6 +517,7 @@
         <svg class="logo" aria-hidden="true"><use href="#wp-logo"/></svg>
         <div class="brand">Watch Party</div>
       </div>
+      <div id="roomName" class="room-name"></div>
       <div class="roomTicket">
         <span class="rtLabel">Room</span>
         <b id="roomCode" class="rtCode"></b>
@@ -1020,7 +1055,7 @@
       myRoom = res.code;
       try { localStorage.setItem("wp-name", myName); } catch (e) {}
       history.replaceState(null, "", "/room/" + res.code);
-      document.title = "Room " + res.code + " - Watch Party";
+      document.title = ((state && state.name) || "Room " + res.code) + " - Watch Party";
       $("lobby").style.display = "none";
       $("room").style.display = "block";
       $("roomCode").textContent = res.code;
@@ -1064,7 +1099,7 @@
           btn("Play", () => socket.emit("library:play", { id: v.id })),
           btn("Queue", () => { socket.emit("library:queue", { id: v.id }); toast("Added to the playlist"); })
         );
-        if (myFid && v.owner === myFid) {
+        if (v.mine) {
           actions.append(btn("Delete", async () => {
             if (!confirm("Delete \"" + v.title + "\" for everyone?")) return;
             try {
@@ -1079,7 +1114,7 @@
     }
     async function loadLibrary() {
       try {
-        const r = await fetch("/api/library");
+        const r = await fetch("/api/library?fid=" + encodeURIComponent(myFid || ""));
         const data = await r.json();
         libMaxMb = data.maxMb || libMaxMb;
         if (!uploading) $("libNote").textContent = "MP4 or WebM files play best. Up to " + fmtLimit(libMaxMb) + " each.";
@@ -1131,14 +1166,17 @@
     // clicking "Create a room" first asks: public or private?
     function goCreate() {
       $("lobbyError").textContent = "";
+      const who = $("name").value.trim() || "Guest";
+      $("roomNameIn").placeholder = who + "'s room"; // the name used if they leave it empty
       $("visModal").hidden = false;
-      $("pickPrivate").focus();
+      $("roomNameIn").focus();
     }
     function createWithVisibility(isPublic) {
       $("visModal").hidden = true;
       myName = $("name").value.trim() || "Guest";
       justCreated = true;
-      socket.emit("room:create", { name: myName, isPublic }, enterRoom);
+      socket.emit("room:create", { name: myName, isPublic, roomName: $("roomNameIn").value.trim() }, enterRoom);
+      $("roomNameIn").value = "";
     }
     $("pickPublic").onclick = () => createWithVisibility(true);
     $("pickPrivate").onclick = () => createWithVisibility(false);
@@ -1146,29 +1184,86 @@
     $("visModal").addEventListener("click", (e) => { if (e.target === $("visModal")) $("visModal").hidden = true; });
     document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("visModal").hidden = true; });
 
-    // list of public rooms on the home page
-    function loadPublicRooms() {
-      if (!socket.connected) return;
-      socket.emit("rooms:public", (res) => {
-        const list = $("pubList");
-        list.innerHTML = "";
-        const rooms = (res && res.rooms) || [];
-        $("pubEmpty").hidden = rooms.length > 0;
-        rooms.forEach((r) => {
-          const li = document.createElement("li");
-          const code = document.createElement("span"); code.className = "pub-code"; code.textContent = r.code;
-          const host = document.createElement("span"); host.className = "pub-host"; host.textContent = "Host: " + r.host;
-          const count = document.createElement("span"); count.className = "pub-count"; count.textContent = r.count + (r.count === 1 ? " person" : " people");
-          const btn = document.createElement("button"); btn.className = "btn small"; btn.textContent = "Join";
-          btn.onclick = () => { $("code").value = r.code; goJoin(); };
-          li.append(code, host, count, btn);
-          list.appendChild(li);
-        });
+    // lists of public and private rooms on the home page
+    function joinFromList(r, code, showError) {
+      myName = $("name").value.trim() || "Guest";
+      socket.emit("room:join", { code, rid: r.rid, name: myName }, (res) => {
+        if (res && res.ok) enterRoom(res); else showError((res && res.error) || "Could not join.");
       });
     }
-    $("pubRefresh").onclick = loadPublicRooms;
-    socket.on("connect", loadPublicRooms);
-    setInterval(() => { if ($("lobby").style.display !== "none" && !document.hidden) loadPublicRooms(); }, 5000);
+
+    function roomRow(r, isPrivate) {
+      const li = document.createElement("li");
+      li.className = "room-row";
+      const main = document.createElement("div");
+      main.className = "room-main";
+      const name = document.createElement("div");
+      name.className = "room-name-text";
+      name.textContent = r.name;
+      const meta = document.createElement("div");
+      meta.className = "room-meta";
+      meta.textContent = "Host " + r.host + ", " + r.count + (r.count === 1 ? " person" : " people");
+      main.append(name, meta);
+      li.append(main);
+
+      const err = document.createElement("div");
+      err.className = "room-err";
+      err.setAttribute("role", "alert");
+
+      if (!isPrivate) {
+        const join = document.createElement("button");
+        join.className = "btn small";
+        join.textContent = "Join";
+        join.onclick = () => joinFromList(r, r.code, (m) => { err.textContent = m; });
+        li.append(join);
+      } else {
+        const form = document.createElement("div");
+        form.className = "room-join";
+        const input = document.createElement("input");
+        input.maxLength = 6;
+        input.placeholder = "Room code";
+        input.autocomplete = "off";
+        input.setAttribute("aria-label", "Room code for " + r.name);
+        const go = document.createElement("button");
+        go.className = "btn small";
+        go.textContent = "Join";
+        const submit = () => {
+          const c = input.value.trim();
+          if (!c) { err.textContent = "Enter the room code."; return; }
+          err.textContent = "";
+          joinFromList(r, c, (m) => { err.textContent = m; });
+        };
+        go.onclick = submit;
+        input.onkeydown = (e) => { if (e.key === "Enter") submit(); };
+        form.append(input, go);
+        li.append(form);
+      }
+      li.append(err);
+      return li;
+    }
+
+    function renderRooms(res) {
+      const pub = (res && res.public) || [];
+      const priv = (res && res.private) || [];
+      $("pubList").innerHTML = "";
+      pub.forEach((r) => $("pubList").append(roomRow(r, false)));
+      $("pubEmpty").hidden = pub.length > 0;
+      // do not rebuild the private list while someone is typing a code into it
+      const typing = [...document.querySelectorAll("#privList input")].some((i) => i.value || i === document.activeElement);
+      if (!typing) {
+        $("privList").innerHTML = "";
+        priv.forEach((r) => $("privList").append(roomRow(r, true)));
+      }
+      $("privEmpty").hidden = priv.length > 0;
+    }
+
+    function loadRooms() {
+      if (!socket.connected) return;
+      socket.emit("rooms:list", renderRooms);
+    }
+    $("pubRefresh").onclick = loadRooms;
+    socket.on("connect", loadRooms);
+    setInterval(() => { if ($("lobby").style.display !== "none" && !document.hidden) loadRooms(); }, 5000);
     function goJoin() {
       myName = $("name").value.trim() || "Guest";
       const code = $("code").value.trim();
@@ -1383,6 +1478,8 @@
     socket.on("state:update", (s) => {
       state = s;
       $("roomVis").textContent = s.isPublic ? "Public" : "Private";
+      $("roomName").textContent = s.name || "";
+      if (s.name) document.title = s.name + " - Watch Party";
       if (s.code !== lastCode) {
         // a different room (joined from an invite): start with a clean chat and a fresh video sync
         if (lastCode !== null) { $("log").innerHTML = ""; unread = 0; health = null; showTab("chat"); }

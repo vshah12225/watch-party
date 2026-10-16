@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const { Server } = require("socket.io");
 
 const app = express();
+app.set("trust proxy", 1); // behind Render's proxy, so req.ip is the visitor, not the proxy
 const server = http.createServer(app);
 const io = new Server(server);
 
@@ -52,6 +53,8 @@ function saveLibrary() {
   fs.renameSync(tmp, LIB_FILE); // swap in one step so a crash never leaves a half-written file
 }
 const libraryUrl = (v) => "/media/" + v.file;
+function safeDecode(s) { try { return decodeURIComponent(String(s || "Guest")); } catch (e) { return "Guest"; } }
+const uploadsByIp = new Map(); // ip -> uploads running right now (we allow 1 at a time)
 const libraryTotal = () => library.reduce((n, v) => n + v.size, 0);
 const libraryByUrl = (url) => library.find((v) => libraryUrl(v) === url);
 
@@ -63,9 +66,11 @@ app.use("/media", express.static(MEDIA_DIR, {
 }));
 
 app.get("/api/library", (req, res) => {
+  const fid = String(req.query.fid || "").toUpperCase();
   res.json({
     maxMb: Math.round(MAX_UPLOAD / 1024 / 1024),
-    videos: library.map((v) => ({ id: v.id, title: v.title, size: v.size, owner: v.owner, by: v.by, addedAt: v.addedAt, url: libraryUrl(v) })),
+    // "mine" tells the page whether to show a Delete button. The owner's Friend ID itself is never sent out.
+    videos: library.map((v) => ({ id: v.id, title: v.title, size: v.size, by: v.by, addedAt: v.addedAt, url: libraryUrl(v), mine: !!fid && fid === v.owner })),
   });
 });
 
@@ -83,6 +88,11 @@ app.put("/api/library/upload", (req, res) => {
   if (size > MAX_UPLOAD) return reject(413, "That file is too big (limit " + Math.round(MAX_UPLOAD / 1024 / 1024) + " MB).");
   if (libraryTotal() + size > MAX_LIBRARY) return reject(507, "The video library is full. Delete a video first.");
 
+  const ip = req.ip;
+  if (uploadsByIp.get(ip)) return reject(429, "One upload at a time. Wait for the first one to finish.");
+  uploadsByIp.set(ip, true);
+  res.on("close", () => uploadsByIp.delete(ip));
+
   const id = crypto.randomBytes(6).toString("hex");
   const file = id + ext;
   const dest = path.join(MEDIA_DIR, file);
@@ -96,7 +106,7 @@ app.put("/api/library/upload", (req, res) => {
     if (!res.headersSent) reject(code2, msg);
   };
   req.on("data", (chunk) => { received += chunk.length; if (received > size || received > MAX_UPLOAD) { req.unpipe(out); fail(413, "Upload was larger than announced."); } });
-  req.on("aborted", () => fail(499, "Upload cancelled."));
+  req.on("close", () => { if (!req.complete) fail(499, "Upload cancelled."); });
   req.on("error", () => fail(500, "Upload failed."));
   out.on("error", () => fail(500, "Could not save the file."));
   out.on("finish", () => {
@@ -108,7 +118,7 @@ app.put("/api/library/upload", (req, res) => {
       file,
       size,
       owner: String(req.get("x-owner") || "").toUpperCase().slice(0, 6),
-      by: decodeURIComponent(String(req.get("x-name") || "Guest")).slice(0, 24) || "Guest",
+      by: safeDecode(req.get("x-name")).slice(0, 24) || "Guest",
       addedAt: Date.now(),
     };
     library.push(entry);
@@ -150,9 +160,14 @@ function makeCode() {
   return code;
 }
 
-function createRoom(hostId, isPublic) {
+// tidy a room name: no line breaks or long runs of spaces, at most 32 characters
+function cleanRoomName(s) { return String(s || "").replace(/\s+/g, " ").trim().slice(0, 32); }
+
+function createRoom(hostId, isPublic, roomName) {
   const room = {
     code: makeCode(),
+    rid: crypto.randomBytes(4).toString("hex"), // public id of the room, safe to show in lists (the code is the secret)
+    name: roomName,
     hostId,
     isPublic: !!isPublic, // true = shown in the public rooms list, false = only people with the code or link can join
     users: new Map(), // socket.id -> name
@@ -195,6 +210,7 @@ function snapshot(room) {
     code: room.code,
     hostId: room.hostId,
     isPublic: room.isPublic,
+    name: room.name,
     users: [...room.users].map(([id, name]) => ({ id, name })),
     playlist: room.playlist,
     poll: pollView(room),
@@ -249,16 +265,18 @@ io.on("connection", (socket) => {
     systemMessage(room, `${name || "Guest"} joined`);
   }
 
-  socket.on("room:create", ({ name, isPublic } = {}, cb) => {
-    const r = createRoom(socket.id, isPublic === true);
+  socket.on("room:create", ({ name, isPublic, roomName } = {}, cb) => {
+    const hostName = String(name || "Guest").trim().slice(0, 24) || "Guest";
+    const r = createRoom(socket.id, isPublic === true, cleanRoomName(roomName) || hostName + "'s room");
     enter(r, name);
     cb && cb({ ok: true, code: r.code });
   });
 
   // Also used for late joins AND reconnects (client calls it again on reconnect)
-  socket.on("room:join", ({ code, name } = {}, cb) => {
+  socket.on("room:join", ({ code, name, rid } = {}, cb) => {
     const r = rooms.get(String(code || "").toUpperCase());
-    if (!r) return cb && cb({ ok: false, error: "Room not found" });
+    if (!r) return cb && cb({ ok: false, error: rid ? "That code is not right." : "Room not found" });
+    if (rid && r.rid !== rid) return cb && cb({ ok: false, error: "That code is not right for this room." });
     if (socket.data.fid && r.banned.has(socket.data.fid))
       return cb && cb({ ok: false, error: "The host removed you from this room." });
     if (room) leave(); // in case of a double join
@@ -266,19 +284,25 @@ io.on("connection", (socket) => {
     cb && cb({ ok: true, code: r.code });
   });
 
-  // The lobby asks for the list of public rooms (private rooms are never listed)
-  socket.on("rooms:public", (cb) => {
+  // The lobby asks for the lists of rooms.
+  // Public rooms come with their code, so one click joins.
+  // Private rooms are shown by name only: their code is never sent, so you have to know it.
+  socket.on("rooms:list", (cb) => {
     if (typeof cb !== "function") return;
-    const list = [...rooms.values()]
-      .filter((r) => r.isPublic && r.users.size > 0)
-      .sort((a, b) => b.users.size - a.users.size)
-      .slice(0, 30)
-      .map((r) => ({
-        code: r.code,
-        host: r.users.get(r.hostId) || "Guest",
-        count: r.users.size,
-      }));
-    cb({ rooms: list });
+    const live = [...rooms.values()]
+      .filter((r) => r.users.size > 0)
+      .sort((a, b) => b.users.size - a.users.size);
+    const view = (r, withCode) => ({
+      rid: r.rid,
+      name: r.name,
+      host: r.users.get(r.hostId) || "Guest",
+      count: r.users.size,
+      ...(withCode ? { code: r.code } : {}),
+    });
+    cb({
+      public: live.filter((r) => r.isPublic).slice(0, 30).map((r) => view(r, true)),
+      private: live.filter((r) => !r.isPublic).slice(0, 30).map((r) => view(r, false)),
+    });
   });
 
   // Anyone can ask for the latest state (used for drift checks)

@@ -61,8 +61,9 @@ async function main() {
   const actions = ["play", "pause", "seek"];
 
   for (let r = 0; r < ROUNDS; r++) {
-    const sender = clients[rand(N)];
     const action = actions[rand(actions.length)];
+    // the host (client 0) is the only one allowed to play / pause; everybody can seek
+    const sender = action === "seek" ? clients[rand(N)] : clients[0];
     const position = Math.random() * 100;
     const expectedVersion = clients[0].state.version + 1;
     const t0 = now();
@@ -99,7 +100,8 @@ async function main() {
     const howMany = Math.min(N, 3 + rand(3)); // 3 to 5 clients act together
     const senders = [...clients].sort(() => Math.random() - 0.5).slice(0, howMany);
     senders.forEach((c) => {
-      const action = actions[rand(actions.length)];
+      let action = actions[rand(actions.length)];
+      if (c !== clients[0] && action !== "seek") action = "seek"; // guests can only seek
       c.socket.emit("playback:" + action, { position: Math.random() * 100 });
     });
     await sleep(400);
